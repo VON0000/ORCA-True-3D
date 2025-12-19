@@ -1,0 +1,1 @@
+val detect_collision : V3.t -> V3.t -> float -> bool
