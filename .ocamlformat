@@ -2,7 +2,7 @@ version=0.26.2
 
 profile=conventional
 
-wrap-comments=true
+wrap-comments=false
 wrap-fun-args=true
 break-infix=fit-or-vertical
 break-separators=after
