@@ -20,3 +20,6 @@ let norm a = sqrt (norm2 a)
 let normalize ?(eps = 1e-12) a =
   let n = norm a in
   if n < eps then zero else 1. /. n * a
+
+let distance2 a b = norm2 (a - b)
+let distance a b = norm (a - b)

@@ -10,3 +10,5 @@ val cross : t -> t -> t
 val norm2 : t -> float
 val norm : t -> float
 val normalize : ?eps:float -> t -> t
+val distance2 : t -> t -> float
+val distance : t -> t -> float

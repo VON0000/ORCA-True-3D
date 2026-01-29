@@ -8,7 +8,7 @@ INCLUDES = -I .
 
 LIBS_OPAM = -package unix
 
-SCML = V3.ml main.ml
+SCML = V3.ml scenario.ml main.ml
 SCCMO = $(SCML:.ml=.cmo)
 SCCMX = $(SCML:.ml=.cmx)
 all: opt
