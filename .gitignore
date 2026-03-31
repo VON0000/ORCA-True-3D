@@ -21,6 +21,8 @@ _build/
 # ocamlbuild targets
 *.byte
 *.native
+*.out
+*.opt
 
 # oasis generated files
 setup.data
@@ -36,3 +38,4 @@ setup.log
 _opam/
 
 .depend
+.codex
