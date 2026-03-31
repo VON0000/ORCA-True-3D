@@ -1,6 +1,6 @@
 # ORCA-True-3D
 
-基于 `ref/` 中论文的三维速度障碍（3D VO）+ 球形势场融合避障复现版本。  
+基于 `ref/` 中论文的三维速度障碍（3D VO）避障复现版本。  
 当前仓库可完成：
 
 - 编译 OCaml 仿真程序
@@ -66,7 +66,7 @@ MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py \
 - 动态障碍位置：`dyn_x,dyn_y,dyn_z`
 - 静态障碍中心：`stat_x,stat_y,stat_z`
 - 最小距离：`d_min`
-- 参数：`rpz,rpf`
+- 参数：`rpz`
 - 目标点：`target_x,target_y,target_z`
 
 ## 5. 参数修改位置
@@ -80,16 +80,15 @@ MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py \
 - `static_obs`
 - `dyn0`（动态障碍初始位置和速度）
 
-### 5.2 算法参数（3D VO + 势场）
+### 5.2 算法参数（3D VO）
 
 修改 `avoid.ml` 中 `default_params`：
 
 - `rpz`：保护半径
-- `rpf`：势场半径（应大于 `rpz`）
-- `kpf`：势场增益
 - `tp_samples`：边界离散采样数
 - `phi_steps` / `phi_window`：避让平面搜索范围与密度
 - `max_speed`：速度上限
+- `vo_margin`：VO 边界速度外扩系数
 
 修改后重新运行：
 
@@ -104,4 +103,3 @@ make viz
 - `viz/plot_3d_avoidance.py`：3D 绘图脚本
 - `Makefile`：编译与一键可视化命令
 - `ref/`：论文 PDF
-
