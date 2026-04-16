@@ -17,10 +17,10 @@ byte: orca.out
 opt: orca.opt
 viz: orca.opt
 	./orca.opt
-	MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.png
+	python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.png
 anim: orca.opt
 	./orca.opt
-	MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.gif --fps 15 --stride 2
+	python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.gif --fps 15 --stride 2
 orca.out: $(SCCMO)
 	$(OCAMLC) -o $@ $(SCCMO)
 orca.opt: $(SCCMX)
