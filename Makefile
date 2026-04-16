@@ -8,15 +8,19 @@ INCLUDES = -I .
 
 LIBS_OPAM = -package unix
 
-SCML = V3.ml avoid.ml main.ml
+SCML = V3.ml avoid.ml scene_config.ml main.ml
 SCCMO = $(SCML:.ml=.cmo)
 SCCMX = $(SCML:.ml=.cmx)
+.PHONY: all byte opt viz anim init clean cleanall
 all: opt
 byte: orca.out
 opt: orca.opt
 viz: orca.opt
 	./orca.opt
 	MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.png
+anim: orca.opt
+	./orca.opt
+	MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.gif --fps 15 --stride 2
 orca.out: $(SCCMO)
 	$(OCAMLC) -o $@ $(SCCMO)
 orca.opt: $(SCCMX)

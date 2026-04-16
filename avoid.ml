@@ -1,8 +1,7 @@
 type state = { pos : V3.t; vel : V3.t }
-type obstacle = { pos : V3.t; vel : V3.t }
+type obstacle = { pos : V3.t; vel : V3.t; radius : float }
 
 type params = {
-  rpz : float;
   tp_samples : int;
   phi_steps : int;
   phi_window : float;
@@ -15,7 +14,6 @@ let eps = 1e-9
 
 let default_params =
   {
-    rpz = 1.0;
     tp_samples = 64;
     phi_steps = 9;
     phi_window = 30.0 *. pi /. 180.0;
@@ -70,22 +68,25 @@ type cone_geom = {
   theta_el : float;
 }
 
-let cone_geometry rpz (p_b : V3.t) =
+let cone_geometry radius_sum (p_b : V3.t) =
   let d = V3.norm p_b in
-  if d <= rpz +. eps then None
+  if d <= radius_sum +. eps then None
   else
     let d2 = d *. d in
-    let base = max 0.0 (d2 -. (rpz *. rpz)) in
-    let rvo = rpz *. sqrt base /. d in
+    let base = max 0.0 (d2 -. (radius_sum *. radius_sum)) in
+    let rvo = radius_sum *. sqrt base /. d in
     let dvo = base /. d in
     let theta_az = atan2 p_b.y p_b.x in
     let xy = sqrt ((p_b.x *. p_b.x) +. (p_b.y *. p_b.y)) in
     let theta_el = atan2 p_b.z xy in
     Some { rvo; dvo; theta_az; theta_el }
 
-let in_collision_cone params (uav : state) (obs : obstacle) =
+let obstacle_radius_sum params self_radius (obs : obstacle) =
+  max eps (self_radius +. obs.radius)
+
+let in_collision_cone params ~self_radius (uav : state) (obs : obstacle) =
   let p_b = V3.(obs.pos - uav.pos) in
-  match cone_geometry params.rpz p_b with
+  match cone_geometry (obstacle_radius_sum params self_radius obs) p_b with
   | None -> true
   | Some g ->
     let v_rel_b = V3.(uav.vel - obs.vel) in
@@ -124,10 +125,10 @@ let angle_to_target (v : V3.t) (t : V3.t) =
     let c = clamp (-1.0) 1.0 (V3.dot v t /. (nv *. nt)) in
     acos c
 
-let select_boundary_velocity params ~(target_b : V3.t) (uav : state)
-  (obs : obstacle) =
+let select_boundary_velocity params ~self_radius ~(target_b : V3.t)
+  (uav : state) (obs : obstacle) =
   let p_b = V3.(obs.pos - uav.pos) in
-  match cone_geometry params.rpz p_b with
+  match cone_geometry (obstacle_radius_sum params self_radius obs) p_b with
   | None -> None
   | Some g ->
     let tp_grid = tp_samples params.tp_samples in
@@ -217,28 +218,31 @@ let select_boundary_velocity params ~(target_b : V3.t) (uav : state)
     done;
     Option.map snd !best
 
-let nearest_obstacle (uav : state) (obstacles : obstacle list) =
+let nearest_collision_obstacle params ~self_radius (uav : state)
+  (obstacles : obstacle list) =
   List.fold_left
     (fun acc obs ->
-      let d = V3.distance uav.pos obs.pos in
-      match acc with
-      | None -> Some (obs, d)
-      | Some (_, d0) when d < d0 -> Some (obs, d)
-      | _ -> acc )
+      if not (in_collision_cone params ~self_radius uav obs) then acc
+      else
+        let d = V3.distance uav.pos obs.pos in
+        match acc with
+        | None -> Some (obs, d)
+        | Some (_, d0) when d < d0 -> Some (obs, d)
+        | _ -> acc )
     None obstacles
 
-let desired_velocity params ~target (uav : state) (obstacles : obstacle list) =
+let desired_velocity params ~self_radius ~target (uav : state)
+  (obstacles : obstacle list) =
   let target_b = V3.(target - uav.pos) in
   let v_pref = limit_speed params.max_speed target_b in
-  match nearest_obstacle uav obstacles with
+  match nearest_collision_obstacle params ~self_radius uav obstacles with
   | None -> v_pref
-  | Some (obs_near, d_near) ->
-    let need_vo = in_collision_cone params uav obs_near in
-    if need_vo then
-      match select_boundary_velocity params ~target_b uav obs_near with
-      | Some v -> limit_speed params.max_speed v
-      | None -> v_pref
-    else v_pref
+  | Some (obs_near, _) -> (
+    match
+      select_boundary_velocity params ~self_radius ~target_b uav obs_near
+    with
+    | Some v -> limit_speed params.max_speed v
+    | None -> v_pref )
 
 let step ~dt (s : state) (v_cmd : V3.t) : state =
   { pos = V3.(s.pos + (dt * v_cmd)); vel = v_cmd }

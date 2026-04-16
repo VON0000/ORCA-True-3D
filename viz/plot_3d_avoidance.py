@@ -5,6 +5,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 
 def plot_sphere(ax, center, radius, color, alpha=0.12, wire_alpha=0.25):
@@ -37,105 +38,413 @@ def set_axes_equal(ax, points):
     ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
+def set_scatter_point(artist, point):
+    artist._offsets3d = ([point[0]], [point[1]], [point[2]])
+
+
+def frame_indices(length, stride):
+    stride = max(1, stride)
+    ids = list(range(0, length, stride))
+    if not ids or ids[-1] != length - 1:
+        ids.append(length - 1)
+    return ids
+
+
+def build_series(entity_id, group):
+    group = group.sort_values("step")
+    return {
+        "id": entity_id,
+        "pos": group[["x", "y", "z"]].to_numpy(dtype=float),
+        "vel": group[["vx", "vy", "vz"]].to_numpy(dtype=float),
+        "goal": group[["goal_x", "goal_y", "goal_z"]].iloc[0].to_numpy(dtype=float),
+        "radius": float(group["radius"].iloc[0]),
+        "step": group["step"].to_numpy(dtype=int),
+        "t": group["t"].to_numpy(dtype=float),
+        "reached": group["reached"].to_numpy(dtype=int),
+        "min_clearance": group["min_clearance"].to_numpy(dtype=float),
+    }
+
+
+def min_clearance_series(agents, timeline_len):
+    if not agents:
+        return np.full(timeline_len, np.nan, dtype=float)
+    result = np.full(timeline_len, np.nan, dtype=float)
+    for idx in range(timeline_len):
+        vals = [
+            agent["min_clearance"][idx]
+            for agent in agents
+            if idx < len(agent["min_clearance"]) and np.isfinite(agent["min_clearance"][idx])
+        ]
+        if vals:
+            result[idx] = float(np.min(vals))
+    return result
+
+
+def build_bounds(statics, agents, dynamics):
+    pts = []
+    for obs in statics:
+        center = obs["center"]
+        radius = obs["radius"]
+        pts.append(center.reshape(1, 3))
+        pts.append(center.reshape(1, 3) + np.array([[radius, radius, radius]]))
+        pts.append(center.reshape(1, 3) - np.array([[radius, radius, radius]]))
+    for series in agents + dynamics:
+        pts.append(series["pos"])
+        pts.append(series["goal"].reshape(1, 3))
+    if not pts:
+        pts = [np.zeros((1, 3), dtype=float)]
+    return np.vstack(pts)
+
+
+def load_trace_multi(df):
+    required = {
+        "step",
+        "t",
+        "kind",
+        "id",
+        "x",
+        "y",
+        "z",
+        "vx",
+        "vy",
+        "vz",
+        "radius",
+        "goal_x",
+        "goal_y",
+        "goal_z",
+        "min_clearance",
+        "reached",
+    }
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Trace CSV is missing columns: {sorted(missing)}")
+
+    statics = []
+    static_df = df[df["kind"] == "static"]
+    for entity_id, group in static_df.groupby("id", sort=False):
+        row = group.iloc[0]
+        statics.append(
+            {
+                "id": entity_id,
+                "center": row[["x", "y", "z"]].to_numpy(dtype=float),
+                "radius": float(row["radius"]),
+            }
+        )
+
+    agents = []
+    agent_df = df[df["kind"] == "agent"]
+    for entity_id, group in agent_df.groupby("id", sort=False):
+        agents.append(build_series(entity_id, group))
+
+    dynamics = []
+    dynamic_df = df[df["kind"] == "dynamic"]
+    for entity_id, group in dynamic_df.groupby("id", sort=False):
+        dynamics.append(build_series(entity_id, group))
+
+    if agents:
+        steps = agents[0]["step"]
+        times = agents[0]["t"]
+    elif dynamics:
+        steps = dynamics[0]["step"]
+        times = dynamics[0]["t"]
+    else:
+        steps = static_df["step"].drop_duplicates().to_numpy(dtype=int)
+        times = static_df["t"].drop_duplicates().to_numpy(dtype=float)
+
+    return {
+        "mode": "multi",
+        "statics": statics,
+        "agents": agents,
+        "dynamics": dynamics,
+        "steps": steps,
+        "times": times,
+        "d_min": min_clearance_series(agents, len(times)),
+        "bounds": build_bounds(statics, agents, dynamics),
+    }
+
+def load_trace(trace_path):
+    df = pd.read_csv(trace_path)
+    if df.empty:
+        raise ValueError("Trace CSV is empty.")
+    return load_trace_multi(df)
+
+
+def color_list(name, count):
+    cmap = plt.get_cmap(name)
+    if count <= 1:
+        return [cmap(0.5)]
+    return [cmap(i / (count - 1)) for i in range(count)]
+
+
+def make_axes(data, title):
+    fig = plt.figure(figsize=(10.5, 8.0))
+    ax = fig.add_subplot(111, projection="3d")
+    set_axes_equal(ax, data["bounds"])
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+    ax.view_init(elev=24, azim=43)
+    ax.grid(True, alpha=0.25)
+    ax.set_title(title)
+
+    agent_colors = color_list("tab10", max(1, len(data["agents"])))
+    dynamic_colors = color_list("Set1", max(1, len(data["dynamics"])))
+
+    for idx, obs in enumerate(data["statics"]):
+        plot_sphere(
+            ax,
+            obs["center"],
+            obs["radius"],
+            color="#ff7f0e",
+            alpha=0.14,
+            wire_alpha=0.28,
+        )
+        ax.scatter(
+            *obs["center"],
+            color="#ff7f0e",
+            s=68,
+            marker="s",
+            label="Static obstacle" if idx == 0 else None,
+        )
+
+    for idx, agent in enumerate(data["agents"]):
+        color = agent_colors[idx]
+        ax.scatter(
+            *agent["goal"],
+            color=color,
+            s=84,
+            marker="*",
+            label="Agent goal" if idx == 0 else None,
+        )
+        ax.scatter(
+            *agent["pos"][0],
+            color=color,
+            s=48,
+            marker="o",
+            alpha=0.85,
+            label="Agent start" if idx == 0 else None,
+        )
+
+    for idx, obs in enumerate(data["dynamics"]):
+        color = dynamic_colors[idx]
+        ax.scatter(
+            *obs["pos"][0],
+            color=color,
+            s=44,
+            marker="D",
+            alpha=0.75,
+            label="Dynamic start" if idx == 0 else None,
+        )
+
+    return fig, ax, agent_colors, dynamic_colors
+
+
+def min_clearance_marker(data):
+    best = None
+    for agent in data["agents"]:
+        clearance = agent["min_clearance"]
+        finite_ids = np.where(np.isfinite(clearance))[0]
+        if finite_ids.size == 0:
+            continue
+        local_idx = finite_ids[np.argmin(clearance[finite_ids])]
+        value = float(clearance[local_idx])
+        if best is None or value < best["value"]:
+            best = {"value": value, "point": agent["pos"][local_idx]}
+    return best
+
+
+def save_static_plot(data, out_path, dpi, title):
+    fig, ax, agent_colors, dynamic_colors = make_axes(data, title)
+
+    for idx, agent in enumerate(data["agents"]):
+        color = agent_colors[idx]
+        ax.plot(
+            agent["pos"][:, 0],
+            agent["pos"][:, 1],
+            agent["pos"][:, 2],
+            color=color,
+            lw=2.2,
+            label=f"Agent {agent['id']}",
+        )
+        ax.scatter(*agent["pos"][-1], color=color, s=72, marker="^")
+
+    for idx, obs in enumerate(data["dynamics"]):
+        color = dynamic_colors[idx]
+        ax.plot(
+            obs["pos"][:, 0],
+            obs["pos"][:, 1],
+            obs["pos"][:, 2],
+            color=color,
+            lw=1.8,
+            linestyle="--",
+            label=f"Dynamic {obs['id']}",
+        )
+        ax.scatter(*obs["pos"][-1], color=color, s=50, marker="o", alpha=0.85)
+
+    marker = min_clearance_marker(data)
+    if marker is not None:
+        ax.scatter(
+            *marker["point"],
+            color="#9467bd",
+            s=78,
+            marker="x",
+            label=f"Min clearance = {marker['value']:.3f}",
+        )
+
+    ax.legend(loc="best", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    print(f"Saved 3D visualization to {out_path}")
+
+
+def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
+    fig, ax, agent_colors, dynamic_colors = make_axes(data, title)
+
+    for idx, agent in enumerate(data["agents"]):
+        color = agent_colors[idx]
+        ax.plot(
+            agent["pos"][:, 0],
+            agent["pos"][:, 1],
+            agent["pos"][:, 2],
+            color=color,
+            lw=1.0,
+            alpha=0.18,
+            linestyle=":",
+        )
+
+    for idx, obs in enumerate(data["dynamics"]):
+        color = dynamic_colors[idx]
+        ax.plot(
+            obs["pos"][:, 0],
+            obs["pos"][:, 1],
+            obs["pos"][:, 2],
+            color=color,
+            lw=1.0,
+            alpha=0.18,
+            linestyle=":",
+        )
+
+    agent_trails = []
+    agent_now = []
+    for idx, agent in enumerate(data["agents"]):
+        color = agent_colors[idx]
+        trail, = ax.plot([], [], [], color=color, lw=2.4, label=f"Agent {agent['id']}")
+        now = ax.scatter([], [], [], color=color, s=66, marker="o")
+        agent_trails.append(trail)
+        agent_now.append(now)
+
+    dynamic_trails = []
+    dynamic_now = []
+    for idx, obs in enumerate(data["dynamics"]):
+        color = dynamic_colors[idx]
+        trail, = ax.plot(
+            [],
+            [],
+            [],
+            color=color,
+            lw=2.0,
+            linestyle="--",
+            label=f"Dynamic {obs['id']}",
+        )
+        now = ax.scatter([], [], [], color=color, s=58, marker="D")
+        dynamic_trails.append(trail)
+        dynamic_now.append(now)
+
+    time_text = ax.text2D(0.03, 0.94, "", transform=ax.transAxes, fontsize=10)
+    dist_text = ax.text2D(0.03, 0.88, "", transform=ax.transAxes, fontsize=10)
+    ax.legend(loc="upper left", fontsize=9)
+
+    frame_ids = frame_indices(len(data["times"]), stride)
+    trail_len = len(data["times"]) if tail <= 0 else tail
+
+    def update(frame_id):
+        idx = frame_ids[frame_id]
+        start = max(0, idx - trail_len + 1)
+
+        artists = []
+        for series, trail, now in zip(data["agents"], agent_trails, agent_now):
+            seg = series["pos"][start : idx + 1]
+            trail.set_data(seg[:, 0], seg[:, 1])
+            trail.set_3d_properties(seg[:, 2])
+            set_scatter_point(now, series["pos"][idx])
+            artists.extend([trail, now])
+
+        for series, trail, now in zip(data["dynamics"], dynamic_trails, dynamic_now):
+            seg = series["pos"][start : idx + 1]
+            trail.set_data(seg[:, 0], seg[:, 1])
+            trail.set_3d_properties(seg[:, 2])
+            set_scatter_point(now, series["pos"][idx])
+            artists.extend([trail, now])
+
+        time_text.set_text(
+            f"t = {data['times'][idx]:.1f}s    step = {int(data['steps'][idx])}"
+        )
+        clearance = data["d_min"][idx]
+        if np.isfinite(clearance):
+            dist_text.set_text(f"min clearance = {clearance:.3f} m")
+        else:
+            dist_text.set_text("min clearance = n/a")
+        artists.extend([time_text, dist_text])
+        return artists
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=len(frame_ids),
+        interval=1000 / max(1, fps),
+        blit=False,
+    )
+    fig.tight_layout()
+    anim.save(out_path, writer=PillowWriter(fps=max(1, fps)), dpi=dpi)
+    print(f"Saved 3D animation to {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Visualize the 3D obstacle-avoidance simulation trace."
     )
     parser.add_argument("--csv", default="sim_trace.csv", help="Input trace CSV")
-    parser.add_argument("--out", default="sim_3d.png", help="Output figure path")
-    parser.add_argument("--dpi", type=int, default=200, help="Figure DPI")
+    parser.add_argument("--out", default="sim_3d.png", help="Output figure or GIF path")
+    parser.add_argument("--dpi", type=int, default=200, help="Output DPI")
     parser.add_argument("--title", default="", help="Optional custom title")
+    parser.add_argument("--fps", type=int, default=15, help="Animation FPS for GIF output")
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=2,
+        help="Frame stride when exporting GIF to reduce size",
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=80,
+        help="Number of historical frames to keep in the animated trail; 0 keeps all",
+    )
     args = parser.parse_args()
 
     trace_path = Path(args.csv)
     if not trace_path.exists():
         raise FileNotFoundError(f"Trace file not found: {trace_path}")
 
-    df = pd.read_csv(trace_path)
-    if df.empty:
-        raise ValueError("Trace CSV is empty.")
-
-    rpz = float(df["rpz"].iloc[0])
-    rpf = float(df["rpf"].iloc[0])
-    target = np.array(
-        [df["target_x"].iloc[0], df["target_y"].iloc[0], df["target_z"].iloc[0]],
-        dtype=float,
-    )
-    static_center = np.array(
-        [df["stat_x"].iloc[0], df["stat_y"].iloc[0], df["stat_z"].iloc[0]],
-        dtype=float,
-    )
-
-    uav = df[["uav_x", "uav_y", "uav_z"]].to_numpy(dtype=float)
-    dyn = df[["dyn_x", "dyn_y", "dyn_z"]].to_numpy(dtype=float)
-    dmin_idx = int(df["d_min"].idxmin())
-    dmin_val = float(df["d_min"].iloc[dmin_idx])
-
-    fig = plt.figure(figsize=(10.5, 8.0))
-    ax = fig.add_subplot(111, projection="3d")
-
-    ax.plot(uav[:, 0], uav[:, 1], uav[:, 2], color="#1f77b4", lw=2.2, label="UAV")
-    ax.plot(
-        dyn[:, 0],
-        dyn[:, 1],
-        dyn[:, 2],
-        color="#d62728",
-        lw=1.8,
-        linestyle="--",
-        label="Dynamic obstacle",
-    )
-
-    ax.scatter(*uav[0], color="#1f77b4", s=56, marker="o", label="Start")
-    ax.scatter(*uav[-1], color="#2ca02c", s=70, marker="^", label="End")
-    ax.scatter(*target, color="#2ca02c", s=80, marker="*", label="Target")
-    ax.scatter(*static_center, color="#ff7f0e", s=70, marker="s", label="Static obstacle")
-
-    plot_sphere(ax, static_center, rpz, color="#ff7f0e", alpha=0.14, wire_alpha=0.28)
-    plot_sphere(ax, static_center, rpf, color="#bcbd22", alpha=0.06, wire_alpha=0.14)
-
-    key_ids = [0, len(dyn) // 2, len(dyn) - 1]
-    for i, idx in enumerate(key_ids):
-        c = dyn[idx]
-        alpha = 0.08 if i < 2 else 0.11
-        plot_sphere(ax, c, rpz, color="#d62728", alpha=alpha, wire_alpha=0.15)
-
-    closest_pt = uav[dmin_idx]
-    ax.scatter(
-        closest_pt[0],
-        closest_pt[1],
-        closest_pt[2],
-        color="#9467bd",
-        s=70,
-        marker="x",
-        label=f"Min distance = {dmin_val:.3f}",
-    )
-
-    bounds_pts = np.vstack(
-        [
-            uav,
-            dyn,
-            target.reshape(1, 3),
-            static_center.reshape(1, 3),
-            static_center.reshape(1, 3) + np.array([[rpf, rpf, rpf]]),
-            static_center.reshape(1, 3) - np.array([[rpf, rpf, rpf]]),
-        ]
-    )
-    set_axes_equal(ax, bounds_pts)
-
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_zlabel("Z (m)")
-    ax.view_init(elev=24, azim=43)
-    ax.grid(True, alpha=0.25)
-    title = args.title.strip() or "3D VO + Potential-Field Avoidance Visualization"
-    ax.set_title(title)
-    ax.legend(loc="best", fontsize=9)
-
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=args.dpi)
-    print(f"Saved 3D visualization to {out_path}")
+
+    data = load_trace(trace_path)
+    title = args.title.strip() or "3D VO Avoidance Visualization"
+
+    suffix = out_path.suffix.lower()
+    if suffix == ".gif":
+        save_gif_animation(
+            data,
+            out_path,
+            dpi=args.dpi,
+            title=title,
+            fps=args.fps,
+            stride=args.stride,
+            tail=args.tail,
+        )
+    else:
+        save_static_plot(data, out_path, dpi=args.dpi, title=title)
 
 
 if __name__ == "__main__":
