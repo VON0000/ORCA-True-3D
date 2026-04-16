@@ -324,30 +324,16 @@ def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
             linestyle=":",
         )
 
-    agent_trails = []
     agent_now = []
     for idx, agent in enumerate(data["agents"]):
         color = agent_colors[idx]
-        trail, = ax.plot([], [], [], color=color, lw=2.4, label=f"Agent {agent['id']}")
         now = ax.scatter([], [], [], color=color, s=66, marker="o")
-        agent_trails.append(trail)
         agent_now.append(now)
 
-    dynamic_trails = []
     dynamic_now = []
     for idx, obs in enumerate(data["dynamics"]):
         color = dynamic_colors[idx]
-        trail, = ax.plot(
-            [],
-            [],
-            [],
-            color=color,
-            lw=2.0,
-            linestyle="--",
-            label=f"Dynamic {obs['id']}",
-        )
-        now = ax.scatter([], [], [], color=color, s=58, marker="D")
-        dynamic_trails.append(trail)
+        now = ax.scatter([], [], [], color=color, s=58, marker="D", label=f"Dynamic {obs['id']}")
         dynamic_now.append(now)
 
     time_text = ax.text2D(0.03, 0.94, "", transform=ax.transAxes, fontsize=10)
@@ -362,19 +348,13 @@ def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
         start = max(0, idx - trail_len + 1)
 
         artists = []
-        for series, trail, now in zip(data["agents"], agent_trails, agent_now):
-            seg = series["pos"][start : idx + 1]
-            trail.set_data(seg[:, 0], seg[:, 1])
-            trail.set_3d_properties(seg[:, 2])
+        for series, now in zip(data["agents"], agent_now):
             set_scatter_point(now, series["pos"][idx])
-            artists.extend([trail, now])
+            artists.append(now)
 
-        for series, trail, now in zip(data["dynamics"], dynamic_trails, dynamic_now):
-            seg = series["pos"][start : idx + 1]
-            trail.set_data(seg[:, 0], seg[:, 1])
-            trail.set_3d_properties(seg[:, 2])
+        for series, now in zip(data["dynamics"], dynamic_now):
             set_scatter_point(now, series["pos"][idx])
-            artists.extend([trail, now])
+            artists.append(now)
 
         time_text.set_text(
             f"t = {data['times'][idx]:.1f}s    step = {int(data['steps'][idx])}"
