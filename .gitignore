@@ -39,3 +39,9 @@ _opam/
 
 .depend
 .codex
+
+# Simulation outputs
+sim_trace.csv
+sim_metrics.csv
+sim_3d.png
+sim_3d.gif
