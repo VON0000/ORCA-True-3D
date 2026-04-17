@@ -113,7 +113,7 @@ MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py \
 配置文件支持以下条目：
 
 - `sim`：仿真设置，例如 `dt`、`max_steps`、输出路径
-- `params`：3D VO / ORCA 参数，例如 `max_speed`、`tp_samples`
+- `params`：3D VO / ORCA 参数，例如 `max_speed`、`time_horizon`
 - `static`：静态障碍物，支持 `id`、`pos`、`radius`
 - `dynamic`：动态障碍物，支持 `id`、`start`、`goal`、`speed`、`radius`
 - `agent`：执行 3D ORCA 的个体，支持 `id`、`start`、`goal`、`radius`
@@ -124,7 +124,7 @@ MPLCONFIGDIR=/tmp/matplotlib python3 viz/plot_3d_avoidance.py \
 
 ```txt
 sim dt=0.1 max_steps=600 trace=sim_trace.csv metrics=sim_metrics.csv
-params max_speed=0.25 tp_samples=72 phi_steps=11 phi_window_deg=30 vo_margin=0.02
+params max_speed=0.25 time_horizon=20.0 vo_margin=0.02
 static id=stat_0 pos=0.7,1.1,2.4 radius=0.32
 dynamic id=dyn_0 start=-0.8,1.9,1.4 goal=3.0,0.6,1.4 speed=0.12 radius=0.18
 agent id=agent_0 start=-2.0,-2.0,1.0 goal=3.4,1.8,2.8 radius=0.22
@@ -134,10 +134,12 @@ agent id=agent_0 start=-2.0,-2.0,1.0 goal=3.4,1.8,2.8 radius=0.22
 
 `params` 行可配置：
 
-- `tp_samples`：边界离散采样数
-- `phi_steps` / `phi_window_deg`：避让平面搜索范围与密度
 - `max_speed`：agent 最大速度
+- `time_horizon`：构造 ORCA 半空间约束时的预测时间窗
 - `vo_margin`：VO 边界速度外扩系数
+
+当前实现会对 `time_horizon` 内可能发生冲突的 agent / obstacle 构造半空间约束，
+再把期望速度 `v_pref` 投影到“速度球 + 全部半空间”的交集中，得到下一步速度。
 
 修改后重新运行：
 
