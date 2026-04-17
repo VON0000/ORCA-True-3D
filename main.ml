@@ -6,6 +6,8 @@ type runtime_agent = {
   radius : float;
   state : Avoid.state;
   reached : bool;
+  stalled : bool;
+  stall_steps : int;
 }
 
 type runtime_dynamic = {
@@ -20,6 +22,15 @@ type runtime_dynamic = {
 let pp_v3 (v : V3.t) = Printf.sprintf "(%.3f, %.3f, %.3f)" v.x v.y v.z
 let stop_distance radius = max 0.15 (radius *. 0.75)
 let bool_to_int b = if b then 1 else 0
+let stall_window_seconds = 6.0
+
+let stall_window_steps dt =
+  max 6 (int_of_float (ceil (stall_window_seconds /. max eps dt)))
+
+let stall_progress_threshold ~dt (params : Avoid.params) radius =
+  max 1e-3 (max (0.01 *. params.max_speed *. dt) (0.005 *. radius))
+
+let stall_clearance_threshold radius = max 1e-3 (0.01 *. radius)
 
 let csv_float v =
   match classify_float v with
@@ -51,6 +62,8 @@ let make_runtime_agent (spec : Scene_config.agent) =
     state =
       { Avoid.pos = (if reached then spec.goal else spec.start); vel = V3.zero };
     reached;
+    stalled = false;
+    stall_steps = 0;
   }
 
 let make_runtime_dynamic (spec : Scene_config.moving_obstacle) =
@@ -66,13 +79,23 @@ let make_runtime_dynamic (spec : Scene_config.moving_obstacle) =
   }
 
 let obstacle_of_static (obs : Scene_config.static_obstacle) : Avoid.obstacle =
-  { Avoid.pos = obs.pos; vel = V3.zero; radius = obs.radius }
+  { Avoid.pos = obs.pos; vel = V3.zero; radius = obs.radius; responsibility = 1.0 }
 
 let obstacle_of_dynamic (obs : runtime_dynamic) : Avoid.obstacle =
-  { Avoid.pos = obs.state.pos; vel = obs.state.vel; radius = obs.radius }
+  {
+    Avoid.pos = obs.state.pos;
+    vel = obs.state.vel;
+    radius = obs.radius;
+    responsibility = 1.0;
+  }
 
 let obstacle_of_agent (agent : runtime_agent) : Avoid.obstacle =
-  { Avoid.pos = agent.state.pos; vel = agent.state.vel; radius = agent.radius }
+  {
+    Avoid.pos = agent.state.pos;
+    vel = agent.state.vel;
+    radius = agent.radius;
+    responsibility = 0.5;
+  }
 
 let clearance_to_obstacle pos radius (obs : Avoid.obstacle) =
   V3.distance pos obs.pos -. (radius +. obs.radius)
@@ -118,8 +141,17 @@ let update_agent ~dt params
   (static_obstacles : Scene_config.static_obstacle list)
   (dynamic_obstacles : runtime_dynamic list) (agents : runtime_agent list)
   (agent : runtime_agent) =
-  if agent.reached then
-    { agent with state = { pos = agent.goal; vel = V3.zero }; reached = true }
+  if agent.reached || agent.stalled then
+    {
+      agent with
+      state =
+        {
+          pos = (if agent.reached then agent.goal else agent.state.pos);
+          vel = V3.zero;
+        };
+      reached = agent.reached;
+      stalled = agent.stalled;
+    }
   else
     let obstacles =
       List.map obstacle_of_static static_obstacles
@@ -130,33 +162,78 @@ let update_agent ~dt params
             )
           [] agents
     in
+    let has_risk =
+      Avoid.has_collision_risk params ~dt ~self_radius:agent.radius agent.state
+        obstacles
+    in
+    let clearance_now = min_clearance agent.state.pos agent.radius obstacles in
+    let d_goal_prev = V3.distance agent.state.pos agent.goal in
     let v_cmd =
-      Avoid.desired_velocity params ~self_radius:agent.radius ~target:agent.goal
-        agent.state obstacles
+      Avoid.desired_velocity params ~dt ~self_radius:agent.radius
+        ~target:agent.goal agent.state obstacles
     in
     let state_next = Avoid.step ~dt agent.state v_cmd in
-    let reached =
-      V3.distance state_next.pos agent.goal <= stop_distance agent.radius
-    in
+    let clearance_next = min_clearance state_next.pos agent.radius obstacles in
+    let d_goal_next = V3.distance state_next.pos agent.goal in
+    let reached = d_goal_next <= stop_distance agent.radius in
     if reached then
-      { agent with state = { pos = agent.goal; vel = V3.zero }; reached = true }
-    else { agent with state = state_next; reached = false }
+      {
+        agent with
+        state = { pos = agent.goal; vel = V3.zero };
+        reached = true;
+        stalled = false;
+        stall_steps = 0;
+      }
+    else
+      let progress = d_goal_prev -. d_goal_next in
+      let low_progress =
+        progress <= stall_progress_threshold ~dt params agent.radius
+      in
+      let overlap_not_improving =
+        match (classify_float clearance_now, classify_float clearance_next) with
+        | FP_nan, _ | _, FP_nan | FP_infinite, _ | _, FP_infinite -> false
+        | _ ->
+          clearance_now < 0.0
+          && clearance_next
+             <= clearance_now +. stall_clearance_threshold agent.radius
+      in
+      let stall_steps =
+        if overlap_not_improving || (has_risk && low_progress) then
+          agent.stall_steps + 1
+        else 0
+      in
+      if stall_steps >= stall_window_steps dt then
+        {
+          agent with
+          state = { pos = agent.state.pos; vel = V3.zero };
+          reached = false;
+          stalled = true;
+          stall_steps;
+        }
+      else
+        {
+          agent with
+          state = state_next;
+          reached = false;
+          stalled = false;
+          stall_steps;
+        }
 
 let write_trace_header oc =
   output_string oc
-    "step,t,kind,id,x,y,z,vx,vy,vz,radius,goal_x,goal_y,goal_z,d_goal,min_clearance,reached\n"
+    "step,t,kind,id,x,y,z,vx,vy,vz,radius,goal_x,goal_y,goal_z,d_goal,min_clearance,reached,stalled\n"
 
 let write_metrics_header oc =
   output_string oc
-    "step,t,reached_agents,total_agents,min_clearance,max_goal_error\n"
+    "step,t,reached_agents,stalled_agents,total_agents,min_clearance,max_goal_error\n"
 
 let write_trace_row oc ~step ~t ~kind ~id ~(pos : V3.t) ~(vel : V3.t) ~radius
-  ~(goal : V3.t) ~d_goal ~min_clearance ~reached =
-  Printf.fprintf oc "%d,%.6f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d\n"
+  ~(goal : V3.t) ~d_goal ~min_clearance ~reached ~stalled =
+  Printf.fprintf oc "%d,%.6f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d\n"
     step t kind id (csv_float pos.x) (csv_float pos.y) (csv_float pos.z)
     (csv_float vel.x) (csv_float vel.y) (csv_float vel.z) (csv_float radius)
     (csv_float goal.x) (csv_float goal.y) (csv_float goal.z) (csv_float d_goal)
-    (csv_float min_clearance) (bool_to_int reached)
+    (csv_float min_clearance) (bool_to_int reached) (bool_to_int stalled)
 
 let write_snapshot trace_oc metrics_oc ~step ~t
   (static_obstacles : Scene_config.static_obstacle list)
@@ -165,14 +242,14 @@ let write_snapshot trace_oc metrics_oc ~step ~t
     (fun (obs : Scene_config.static_obstacle) ->
       write_trace_row trace_oc ~step ~t ~kind:"static" ~id:obs.id ~pos:obs.pos
         ~vel:V3.zero ~radius:obs.radius ~goal:obs.pos ~d_goal:0.0
-        ~min_clearance:nan ~reached:true )
+        ~min_clearance:nan ~reached:true ~stalled:false )
     static_obstacles;
   List.iter
     (fun (obs : runtime_dynamic) ->
       write_trace_row trace_oc ~step ~t ~kind:"dynamic" ~id:obs.id
         ~pos:obs.state.pos ~vel:obs.state.vel ~radius:obs.radius ~goal:obs.goal
         ~d_goal:(V3.distance obs.state.pos obs.goal)
-        ~min_clearance:nan ~reached:obs.reached )
+        ~min_clearance:nan ~reached:obs.reached ~stalled:false )
     dynamic_obstacles;
   let agent_clearances =
     List.map
@@ -191,13 +268,18 @@ let write_snapshot trace_oc metrics_oc ~step ~t
         write_trace_row trace_oc ~step ~t ~kind:"agent" ~id:agent.id
           ~pos:agent.state.pos ~vel:agent.state.vel ~radius:agent.radius
           ~goal:agent.goal ~d_goal ~min_clearance:clearance
-          ~reached:agent.reached;
+          ~reached:agent.reached ~stalled:agent.stalled;
         clearance )
       agents
   in
   let reached_agents =
     List.fold_left
       (fun acc (agent : runtime_agent) -> if agent.reached then acc + 1 else acc)
+      0 agents
+  in
+  let stalled_agents =
+    List.fold_left
+      (fun acc (agent : runtime_agent) -> if agent.stalled then acc + 1 else acc)
       0 agents
   in
   let max_goal_error =
@@ -214,8 +296,8 @@ let write_snapshot trace_oc metrics_oc ~step ~t
         | _ -> min acc value )
       infinity agent_clearances
   in
-  Printf.fprintf metrics_oc "%d,%.6f,%d,%d,%s,%s\n" step t reached_agents
-    (List.length agents)
+  Printf.fprintf metrics_oc "%d,%.6f,%d,%d,%d,%s,%s\n" step t reached_agents
+    stalled_agents (List.length agents)
     (csv_float
        ( if classify_float min_clearance = FP_infinite then nan
          else min_clearance ) )
@@ -227,20 +309,26 @@ let print_progress ~t agents metrics_min_clearance =
       (fun acc (agent : runtime_agent) -> if agent.reached then acc + 1 else acc)
       0 agents
   in
+  let stalled_agents =
+    List.fold_left
+      (fun acc (agent : runtime_agent) -> if agent.stalled then acc + 1 else acc)
+      0 agents
+  in
   let anchor =
     match agents with
     | [] -> "none"
     | agent :: _ ->
-      Printf.sprintf "%s pos=%s vel=%s" agent.id (pp_v3 agent.state.pos)
-        (pp_v3 agent.state.vel)
+      Printf.sprintf "%s pos=%s vel=%s stalled=%d" agent.id
+        (pp_v3 agent.state.pos) (pp_v3 agent.state.vel)
+        (bool_to_int agent.stalled)
   in
   let clearance_text =
     match classify_float metrics_min_clearance with
     | FP_nan | FP_infinite -> "n/a"
     | _ -> Printf.sprintf "%.3f" metrics_min_clearance
   in
-  Printf.printf "t=%5.2fs reached=%d/%d min_clearance=%s anchor=%s\n%!" t
-    reached_agents (List.length agents) clearance_text anchor
+  Printf.printf "t=%5.2fs reached=%d stalled=%d total=%d min_clearance=%s anchor=%s\n%!"
+    t reached_agents stalled_agents (List.length agents) clearance_text anchor
 
 let run_demo () =
   let config_path =
@@ -304,9 +392,29 @@ let run_demo () =
     let all_reached =
       List.for_all (fun (agent : runtime_agent) -> agent.reached) agents
     in
+    let all_inactive =
+      List.for_all
+        (fun (agent : runtime_agent) -> agent.reached || agent.stalled)
+        agents
+    in
     if all_reached then (
       close_outputs ();
       Printf.printf "All agents reached their goals at t=%.2fs\n%!" t )
+    else if all_inactive then (
+      let reached_agents =
+        List.fold_left
+          (fun acc (agent : runtime_agent) -> if agent.reached then acc + 1 else acc)
+          0 agents
+      in
+      let stalled_agents =
+        List.fold_left
+          (fun acc (agent : runtime_agent) -> if agent.stalled then acc + 1 else acc)
+          0 agents
+      in
+      close_outputs ();
+      Printf.printf
+        "Simulation ended with %d reached and %d stalled agents at t=%.2fs\n%!"
+        reached_agents stalled_agents t )
     else if step >= config.max_steps then (
       close_outputs ();
       Printf.printf "Simulation ended at step limit (%d)\n%!" config.max_steps )

@@ -22,7 +22,6 @@ type t = {
 }
 
 let default_path = "scene.conf"
-let pi = 4.0 *. atan 1.0
 
 exception Config_error of string
 
@@ -31,11 +30,9 @@ type partial = {
   max_steps : int;
   trace_path : string;
   metrics_path : string;
-  tp_samples : int;
-  phi_steps : int;
-  phi_window : float;
   max_speed : float;
   vo_margin : float;
+  time_horizon : float;
   static_obstacles : static_obstacle list;
   dynamic_obstacles : moving_obstacle list;
   agents : agent list;
@@ -47,11 +44,9 @@ let default_partial =
     max_steps = 600;
     trace_path = "sim_trace.csv";
     metrics_path = "sim_metrics.csv";
-    tp_samples = Avoid.default_params.tp_samples;
-    phi_steps = Avoid.default_params.phi_steps;
-    phi_window = Avoid.default_params.phi_window;
     max_speed = Avoid.default_params.max_speed;
     vo_margin = Avoid.default_params.vo_margin;
+    time_horizon = Avoid.default_params.time_horizon;
     static_obstacles = [];
     dynamic_obstacles = [];
     agents = [];
@@ -159,23 +154,7 @@ let parse_sim_entry path line_no kvs (cfg : partial) =
 
 let parse_params_entry path line_no kvs (cfg : partial) =
   ensure_only_keys path line_no "params" kvs
-    [ "tp_samples"; "phi_steps"; "phi_window_deg"; "max_speed"; "vo_margin" ];
-  let tp_samples =
-    match find_optional kvs "tp_samples" with
-    | Some value -> parse_int path line_no "tp_samples" value
-    | None -> cfg.tp_samples
-  in
-  let phi_steps =
-    match find_optional kvs "phi_steps" with
-    | Some value -> parse_int path line_no "phi_steps" value
-    | None -> cfg.phi_steps
-  in
-  let phi_window =
-    match find_optional kvs "phi_window_deg" with
-    | Some value ->
-      parse_float path line_no "phi_window_deg" value *. pi /. 180.0
-    | None -> cfg.phi_window
-  in
+    [ "max_speed"; "vo_margin"; "time_horizon" ];
   let max_speed =
     match find_optional kvs "max_speed" with
     | Some value -> parse_float path line_no "max_speed" value
@@ -186,7 +165,17 @@ let parse_params_entry path line_no kvs (cfg : partial) =
     | Some value -> parse_float path line_no "vo_margin" value
     | None -> cfg.vo_margin
   in
-  { cfg with tp_samples; phi_steps; phi_window; max_speed; vo_margin }
+  let time_horizon =
+    match find_optional kvs "time_horizon" with
+    | Some value -> parse_float path line_no "time_horizon" value
+    | None -> cfg.time_horizon
+  in
+  {
+    cfg with
+    max_speed;
+    vo_margin;
+    time_horizon;
+  }
 
 let parse_static_entry path line_no kvs (cfg : partial) =
   ensure_only_keys path line_no "static" kvs [ "id"; "pos"; "radius" ];
@@ -244,10 +233,8 @@ let finalize path (cfg : partial) =
     raise (Config_error (Printf.sprintf "%s: max_steps must be >= 0" path));
   if cfg.max_speed <= 0.0 then
     raise (Config_error (Printf.sprintf "%s: max_speed must be > 0" path));
-  if cfg.tp_samples < 8 then
-    raise (Config_error (Printf.sprintf "%s: tp_samples must be >= 8" path));
-  if cfg.phi_steps < 2 then
-    raise (Config_error (Printf.sprintf "%s: phi_steps must be >= 2" path));
+  if cfg.time_horizon <= 0.0 then
+    raise (Config_error (Printf.sprintf "%s: time_horizon must be > 0" path));
   if cfg.agents = [] then
     raise
       (Config_error
@@ -294,11 +281,9 @@ let finalize path (cfg : partial) =
     metrics_path = cfg.metrics_path;
     params =
       {
-        tp_samples = cfg.tp_samples;
-        phi_steps = cfg.phi_steps;
-        phi_window = cfg.phi_window;
         max_speed = cfg.max_speed;
         vo_margin = cfg.vo_margin;
+        time_horizon = cfg.time_horizon;
       };
     static_obstacles = List.rev cfg.static_obstacles;
     dynamic_obstacles = List.rev cfg.dynamic_obstacles;

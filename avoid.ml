@@ -1,248 +1,204 @@
 type state = { pos : V3.t; vel : V3.t }
-type obstacle = { pos : V3.t; vel : V3.t; radius : float }
 
-type params = {
-  tp_samples : int;
-  phi_steps : int;
-  phi_window : float;
-  max_speed : float;
-  vo_margin : float;
+type obstacle = {
+  pos : V3.t;
+  vel : V3.t;
+  radius : float;
+  responsibility : float;
 }
 
-let pi = 4.0 *. atan 1.0
+type params = { max_speed : float; vo_margin : float; time_horizon : float }
+type plane = { normal : V3.t; point : V3.t }
+type projection_set = Speed_ball | Half_space of plane
+
 let eps = 1e-9
-
-let default_params =
-  {
-    tp_samples = 64;
-    phi_steps = 9;
-    phi_window = 30.0 *. pi /. 180.0;
-    max_speed = 0.25;
-    vo_margin = 0.02;
-  }
-
+let projection_iters = 80
+let projection_tol = 1e-5
+let default_params = { max_speed = 0.25; vo_margin = 0.02; time_horizon = 20.0 }
 let clamp lo hi x = max lo (min hi x)
 
 let limit_speed vmax v =
   let n = V3.norm v in
   if n <= vmax || n < eps then v else V3.(vmax /. n * v)
 
-let rotate_x phi (v : V3.t) : V3.t =
-  let c = cos phi in
-  let s = sin phi in
-  { x = v.x; y = (c *. v.y) +. (s *. v.z); z = (-.s *. v.y) +. (c *. v.z) }
+(* 计算一个垂直于 a b 的向量 *)
+let cross (a : V3.t) (b : V3.t) : V3.t =
+  V3.make
+    ((a.y *. b.z) -. (a.z *. b.y))
+    ((a.z *. b.x) -. (a.x *. b.z))
+    ((a.x *. b.y) -. (a.y *. b.x))
 
-let rotate_x_inv phi (v : V3.t) : V3.t =
-  let c = cos phi in
-  let s = sin phi in
-  { x = v.x; y = (c *. v.y) -. (s *. v.z); z = (s *. v.y) +. (c *. v.z) }
-
-(* Eq. (8): rotate vector from {c} to {b}. *)
-let rotate_c_to_b theta_az theta_el (v : V3.t) : V3.t =
-  let caz = cos theta_az in
-  let saz = sin theta_az in
-  let cel = cos theta_el in
-  let sel = sin theta_el in
-  {
-    x = (caz *. cel *. v.x) +. (-.saz *. v.y) +. (-.caz *. sel *. v.z);
-    y = (-.saz *. cel *. v.x) +. (caz *. v.y) +. (-.saz *. sel *. v.z);
-    z = (-.sel *. v.x) +. (cel *. v.z);
-  }
-
-(* Eq. (4): rotate vector from {b} to {c}. *)
-let rotate_b_to_c theta_az theta_el (v : V3.t) : V3.t =
-  let caz = cos theta_az in
-  let saz = sin theta_az in
-  let cel = cos theta_el in
-  let sel = sin theta_el in
-  {
-    x = (caz *. cel *. v.x) +. (saz *. cel *. v.y) +. (-.sel *. v.z);
-    y = (-.saz *. v.x) +. (caz *. v.y);
-    z = (caz *. sel *. v.x) +. (-.saz *. sel *. v.y) +. (cel *. v.z);
-  }
-
-type cone_geom = {
-  rvo : float;
-  dvo : float;
-  theta_az : float;
-  theta_el : float;
-}
-
-let cone_geometry radius_sum (p_b : V3.t) =
-  let d = V3.norm p_b in
-  if d <= radius_sum +. eps then None
+let choose_orthogonal (axis : V3.t) : V3.t =
+  let ax = abs_float axis.x in
+  let ay = abs_float axis.y in
+  let az = abs_float axis.z in
+  let basis =
+    if ax <= ay && ax <= az then V3.make 1.0 0.0 0.0
+    else if ay <= az then V3.make 0.0 1.0 0.0
+    else V3.make 0.0 0.0 1.0
+  in
+  let ortho = cross axis basis in
+  let n = V3.norm ortho in
+  if n > eps then V3.(1.0 /. n * ortho)
   else
-    let d2 = d *. d in
-    let base = max 0.0 (d2 -. (radius_sum *. radius_sum)) in
-    let rvo = radius_sum *. sqrt base /. d in
-    let dvo = base /. d in
-    let theta_az = atan2 p_b.y p_b.x in
-    let xy = sqrt ((p_b.x *. p_b.x) +. (p_b.y *. p_b.y)) in
-    let theta_el = atan2 p_b.z xy in
-    Some { rvo; dvo; theta_az; theta_el }
+    let fallback = cross axis (V3.make 0.0 1.0 0.0) in
+    let nf = V3.norm fallback in
+    if nf > eps then V3.(1.0 /. nf * fallback) else V3.make 1.0 0.0 0.0
+
+let project_ball vmax v = limit_speed vmax v
+
+let project_half_space (pl : plane) (v : V3.t) =
+  let delta = V3.dot pl.normal V3.(v - pl.point) in
+  if delta >= 0.0 then v else V3.(v + (-.delta * pl.normal))
+
+let satisfies_half_space (pl : plane) (v : V3.t) =
+  V3.dot pl.normal V3.(v - pl.point) >= -1e-6
+
+let project_set vmax set v =
+  match set with
+  | Speed_ball -> project_ball vmax v
+  | Half_space pl -> project_half_space pl v
+
+let feasible vmax planes v =
+  V3.norm v <= vmax +. 1e-6
+  && List.for_all (fun pl -> satisfies_half_space pl v) planes
+
+let dykstra_project vmax planes v_pref =
+  let sets =
+    Array.of_list (Speed_ball :: List.map (fun pl -> Half_space pl) planes)
+  in
+  let corrections = Array.make (Array.length sets) V3.zero in
+  let x = ref v_pref in
+  let converged = ref false in
+  let iter = ref 0 in
+  while (not !converged) && !iter < projection_iters do
+    incr iter;
+    let before = !x in
+    for i = 0 to Array.length sets - 1 do
+      let y = V3.(!x + corrections.(i)) in
+      let z = project_set vmax sets.(i) y in
+      corrections.(i) <- V3.(y - z);
+      x := z
+    done;
+    converged :=
+      V3.distance before !x <= projection_tol && feasible vmax planes !x
+  done;
+  project_ball vmax !x
 
 let obstacle_radius_sum params self_radius (obs : obstacle) =
-  max eps (self_radius +. obs.radius)
+  max eps (self_radius +. obs.radius +. params.vo_margin)
 
-let in_collision_cone params ~self_radius (uav : state) (obs : obstacle) =
-  let p_b = V3.(obs.pos - uav.pos) in
-  match cone_geometry (obstacle_radius_sum params self_radius obs) p_b with
-  | None -> true
-  | Some g ->
-    let v_rel_b = V3.(uav.vel - obs.vel) in
-    let v_rel_c = rotate_b_to_c g.theta_az g.theta_el v_rel_b in
-    if v_rel_c.x <= eps then false
+let cone_candidate axis basis s radial cos_theta sin_theta =
+  let t = (s *. cos_theta) +. (radial *. sin_theta) in
+  let axial = t *. cos_theta in
+  let lateral = t *. sin_theta in
+  let point = V3.((axial * axis) + (lateral * basis)) in
+  (t, point)
+
+let pick_closest_point v candidates =
+  match candidates with
+  | [] -> None
+  | q :: rest ->
+    Some
+      (List.fold_left
+         (fun best q_cur ->
+           if V3.distance v q_cur < V3.distance v best then q_cur else best )
+         q rest )
+
+let clamp_responsibility x = clamp 0.0 1.0 x
+
+let orca_plane_for_obstacle params ~dt ~self_radius (uav : state)
+  (obs : obstacle) =
+  let radius = obstacle_radius_sum params self_radius obs in
+  let p = V3.(obs.pos - uav.pos) in
+  let v_rel = V3.(uav.vel - obs.vel) in
+  let dist = V3.norm p in
+  let responsibility = clamp_responsibility obs.responsibility in
+  if dist < eps then
+    let normal =
+      let n = V3.norm v_rel in
+      if n > eps then V3.(1.0 /. n * v_rel) else V3.make 1.0 0.0 0.0
+    in
+    let inv_dt = 1.0 /. max dt 1e-3 in
+    let u = V3.(radius *. inv_dt * normal) in
+    Some { normal; point = V3.(uav.vel + (responsibility * u)) }
+  else if dist <= radius +. eps then
+    let inv_dt = 1.0 /. max dt 1e-3 in
+    let w = V3.(v_rel - (inv_dt * p)) in
+    let unit_w =
+      let nw = V3.norm w in
+      if nw > eps then V3.(1.0 /. nw * w) else V3.(-1.0 /. dist * p)
+    in
+    let magnitude = (radius *. inv_dt) -. V3.norm w in
+    let u = V3.(magnitude * unit_w) in
+    let nu = V3.norm u in
+    if nu < eps then None
     else
-      let lateral =
-        sqrt ((v_rel_c.y *. v_rel_c.y) +. (v_rel_c.z *. v_rel_c.z))
-      in
-      let lhs = lateral /. v_rel_c.x in
-      let rhs = g.rvo /. max eps g.dvo in
-      lhs < rhs
-
-let tp_samples n =
-  let n = max 8 n in
-  Array.init (n + 1) (fun i -> 2.0 *. pi *. float_of_int i /. float_of_int n)
-
-let shoelace_area_xy (pts : V3.t list) =
-  match pts with
-  | [] | [ _ ] | [ _; _ ] -> infinity
-  | _ ->
-    let arr = Array.of_list pts in
-    let n = Array.length arr in
-    let sum = ref 0.0 in
-    for i = 0 to n - 1 do
-      let j = if i = n - 1 then 0 else i + 1 in
-      sum := !sum +. ((arr.(i).x *. arr.(j).y) -. (arr.(j).x *. arr.(i).y))
-    done;
-    abs_float !sum *. 0.5
-
-let angle_to_target (v : V3.t) (t : V3.t) =
-  let nv = V3.norm v in
-  let nt = V3.norm t in
-  if nv < eps || nt < eps then infinity
+      let normal = V3.(1.0 /. nu * u) in
+      Some { normal; point = V3.(uav.vel + (responsibility * u)) }
   else
-    let c = clamp (-1.0) 1.0 (V3.dot v t /. (nv *. nt)) in
-    acos c
-
-let select_boundary_velocity params ~self_radius ~(target_b : V3.t)
-  (uav : state) (obs : obstacle) =
-  let p_b = V3.(obs.pos - uav.pos) in
-  match cone_geometry (obstacle_radius_sum params self_radius obs) p_b with
-  | None -> None
-  | Some g ->
-    let tp_grid = tp_samples params.tp_samples in
-    let target_y = target_b.y in
-    let target_z = target_b.z in
-    let phi_target =
-      if abs_float target_y < eps then
-        clamp
-          ((-0.5 *. pi) +. 1e-6)
-          ((0.5 *. pi) -. 1e-6)
-          (if target_z >= 0.0 then 0.5 *. pi else -0.5 *. pi)
-      else atan (target_z /. target_y)
+    let horizon = max params.time_horizon dt in
+    let center = V3.(1.0 /. horizon * p) in
+    let cap_radius = radius /. horizon in
+    let axis = V3.(1.0 /. dist * p) in
+    let radial_base = sqrt (max 0.0 ((dist *. dist) -. (radius *. radius))) in
+    let cos_theta = radial_base /. dist in
+    let sin_theta = radius /. dist in
+    let tan_theta = radius /. radial_base in
+    let s_cap = radial_base *. radial_base /. (dist *. horizon) in
+    let s = V3.dot v_rel axis in
+    let v_perp = V3.(v_rel - (s * axis)) in
+    let radial = V3.norm v_perp in
+    let basis =
+      if radial > eps then V3.(1.0 /. radial * v_perp)
+      else choose_orthogonal axis
     in
-    let lo =
-      clamp
-        ((-0.5 *. pi) +. 1e-6)
-        ((0.5 *. pi) -. 1e-6)
-        (phi_target -. params.phi_window)
+    let inside_cap = V3.distance v_rel center <= cap_radius +. 1e-6 in
+    let inside_cone =
+      s >= s_cap -. 1e-6 && radial <= (s *. tan_theta) +. 1e-6
     in
-    let hi =
-      clamp
-        ((-0.5 *. pi) +. 1e-6)
-        ((0.5 *. pi) -. 1e-6)
-        (phi_target +. params.phi_window)
-    in
-    let steps = max 2 params.phi_steps in
-    let pick_for_phi phi =
-      let a_phi = rotate_x phi obs.vel in
-      let target_phi = rotate_x phi target_b in
-      let boundary =
-        Array.fold_left
-          (fun acc tp ->
-            let b_vo_c = V3.make g.dvo (g.rvo *. cos tp) (g.rvo *. sin tp) in
-            let b_vo_b =
-              V3.(rotate_c_to_b g.theta_az g.theta_el b_vo_c + obs.vel)
-            in
-            let b_phi = rotate_x phi b_vo_b in
-            let den = b_phi.z -. a_phi.z in
-            if abs_float den < eps then acc
-            else
-              let tg = a_phi.z /. (a_phi.z -. b_phi.z) in
-              if tg < 0.0 then acc
-              else
-                let inter =
-                  V3.make
-                    (((b_phi.x -. a_phi.x) *. tg) +. a_phi.x)
-                    (((b_phi.y -. a_phi.y) *. tg) +. a_phi.y)
-                    0.0
-                in
-                inter :: acc )
-          [] tp_grid
-      in
-      let boundary = List.rev boundary in
-      let area = shoelace_area_xy boundary in
-      if classify_float area = FP_infinite then None
-      else
-        let target_xy = { target_phi with z = 0.0 } in
-        let best =
-          List.fold_left
-            (fun best p ->
-              let score = angle_to_target p target_xy in
-              match best with
-              | None -> Some (score, p)
-              | Some (s, q) -> if score < s then Some (score, p) else Some (s, q)
-              )
-            None boundary
+    if not (inside_cap || inside_cone) then None
+    else
+      let sphere_point =
+        let offset = V3.(v_rel - center) in
+        let dir =
+          let n = V3.norm offset in
+          if n > eps then V3.(1.0 /. n * offset) else V3.(-1.0 * axis)
         in
-        match best with
-        | None -> None
-        | Some (_, chosen) ->
-          let v_phi = V3.((1.0 +. params.vo_margin) * chosen) in
-          Some (area, rotate_x_inv phi v_phi)
-    in
-    let best = ref None in
-    for i = 0 to steps - 1 do
-      let alpha =
-        if steps = 1 then 0.5 else float_of_int i /. float_of_int (steps - 1)
+        let q = V3.(center + (cap_radius * dir)) in
+        if V3.dot q axis <= s_cap +. 1e-6 then Some q else None
       in
-      let phi = lo +. ((hi -. lo) *. alpha) in
-      match pick_for_phi phi with
-      | None -> ()
-      | Some (area, v) -> (
-        match !best with
-        | None -> best := Some (area, v)
-        | Some (a_best, _) when area < a_best -> best := Some (area, v)
-        | _ -> () )
-    done;
-    Option.map snd !best
+      let cone_point =
+        let t, q = cone_candidate axis basis s radial cos_theta sin_theta in
+        if t >= (radial_base /. horizon) -. 1e-6 then Some q else None
+      in
+      let candidates =
+        List.filter_map (fun x -> x) [ sphere_point; cone_point ]
+      in
+      match pick_closest_point v_rel candidates with
+      | None -> None
+      | Some boundary ->
+        let u = V3.(boundary - v_rel) in
+        let nu = V3.norm u in
+        if nu < eps then None
+        else
+          let normal = V3.(1.0 /. nu * u) in
+          Some { normal; point = V3.(uav.vel + (responsibility * u)) }
 
-let nearest_collision_obstacle params ~self_radius (uav : state)
-  (obstacles : obstacle list) =
-  List.fold_left
-    (fun acc obs ->
-      if not (in_collision_cone params ~self_radius uav obs) then acc
-      else
-        let d = V3.distance uav.pos obs.pos in
-        match acc with
-        | None -> Some (obs, d)
-        | Some (_, d0) when d < d0 -> Some (obs, d)
-        | _ -> acc )
-    None obstacles
+let active_planes params ~dt ~self_radius uav obstacles =
+  List.filter_map
+    (orca_plane_for_obstacle params ~dt ~self_radius uav)
+    obstacles
 
-let desired_velocity params ~self_radius ~target (uav : state)
+let has_collision_risk params ~dt ~self_radius uav obstacles =
+  active_planes params ~dt ~self_radius uav obstacles <> []
+
+let desired_velocity params ~dt ~self_radius ~target (uav : state)
   (obstacles : obstacle list) =
-  let target_b = V3.(target - uav.pos) in
-  let v_pref = limit_speed params.max_speed target_b in
-  match nearest_collision_obstacle params ~self_radius uav obstacles with
-  | None -> v_pref
-  | Some (obs_near, _) -> (
-    match
-      select_boundary_velocity params ~self_radius ~target_b uav obs_near
-    with
-    | Some v -> limit_speed params.max_speed v
-    | None -> v_pref )
+  let target_delta = V3.(target - uav.pos) in
+  let v_pref = limit_speed params.max_speed target_delta in
+  let planes = active_planes params ~dt ~self_radius uav obstacles in
+  if planes = [] then v_pref else dykstra_project params.max_speed planes v_pref
 
 let step ~dt (s : state) (v_cmd : V3.t) : state =
   { pos = V3.(s.pos + (dt * v_cmd)); vel = v_cmd }
