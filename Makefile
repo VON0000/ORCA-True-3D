@@ -7,6 +7,7 @@ OCAMLDOC = ocamldoc -html
 INCLUDES = -I .
 
 LIBS_OPAM = -package unix
+PLOT_AIRSPACE = --xlim 0 2000 --ylim 0 2000 --zlim 0 2000
 
 SCML = V3.ml avoid.ml scene_config.ml main.ml
 SCCMO = $(SCML:.ml=.cmo)
@@ -17,10 +18,10 @@ byte: orca.out
 opt: orca.opt
 viz: orca.opt
 	./orca.opt
-	python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.png
+	python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.png $(PLOT_AIRSPACE)
 anim: orca.opt
 	./orca.opt
-	python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.gif --fps 15 --stride 2
+	python3 viz/plot_3d_avoidance.py --csv sim_trace.csv --out sim_3d.gif --fps 15 --stride 2 $(PLOT_AIRSPACE)
 orca.out: $(SCCMO)
 	$(OCAMLC) -o $@ $(SCCMO)
 orca.opt: $(SCCMX)

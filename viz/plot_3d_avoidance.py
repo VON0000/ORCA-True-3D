@@ -38,8 +38,23 @@ def set_axes_equal(ax, points):
     ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
+def apply_axes_limits(ax, points, xlim=None, ylim=None, zlim=None):
+    set_axes_equal(ax, points)
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    if zlim is not None:
+        ax.set_zlim(*zlim)
+    ax.set_box_aspect((1.0, 1.0, 1.0))
+
+
 def set_scatter_point(artist, point):
     artist._offsets3d = ([point[0]], [point[1]], [point[2]])
+
+
+def hide_scatter_point(artist):
+    artist._offsets3d = ([np.nan], [np.nan], [np.nan])
 
 
 def frame_indices(length, stride):
@@ -52,6 +67,11 @@ def frame_indices(length, stride):
 
 def build_series(entity_id, group):
     group = group.sort_values("step")
+    stalled = (
+        group["stalled"].to_numpy(dtype=int)
+        if "stalled" in group.columns
+        else np.zeros(len(group), dtype=int)
+    )
     return {
         "id": entity_id,
         "pos": group[["x", "y", "z"]].to_numpy(dtype=float),
@@ -61,6 +81,7 @@ def build_series(entity_id, group):
         "step": group["step"].to_numpy(dtype=int),
         "t": group["t"].to_numpy(dtype=float),
         "reached": group["reached"].to_numpy(dtype=int),
+        "stalled": stalled,
         "min_clearance": group["min_clearance"].to_numpy(dtype=float),
     }
 
@@ -176,10 +197,10 @@ def color_list(name, count):
     return [cmap(i / (count - 1)) for i in range(count)]
 
 
-def make_axes(data, title):
+def make_axes(data, title, xlim=None, ylim=None, zlim=None):
     fig = plt.figure(figsize=(10.5, 8.0))
     ax = fig.add_subplot(111, projection="3d")
-    set_axes_equal(ax, data["bounds"])
+    apply_axes_limits(ax, data["bounds"], xlim=xlim, ylim=ylim, zlim=zlim)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
@@ -253,9 +274,19 @@ def min_clearance_marker(data):
     return best
 
 
-def save_static_plot(data, out_path, dpi, title):
-    fig, ax, agent_colors, dynamic_colors = make_axes(data, title)
+def first_stall_marker(agent):
+    stalled_ids = np.where(agent["stalled"] != 0)[0]
+    if stalled_ids.size == 0:
+        return None
+    return int(stalled_ids[0])
 
+
+def save_static_plot(data, out_path, dpi, title, xlim=None, ylim=None, zlim=None):
+    fig, ax, agent_colors, dynamic_colors = make_axes(
+        data, title, xlim=xlim, ylim=ylim, zlim=zlim
+    )
+
+    stalled_label_used = False
     for idx, agent in enumerate(data["agents"]):
         color = agent_colors[idx]
         ax.plot(
@@ -266,7 +297,32 @@ def save_static_plot(data, out_path, dpi, title):
             lw=2.2,
             label=f"Agent {agent['id']}",
         )
-        ax.scatter(*agent["pos"][-1], color=color, s=72, marker="^")
+        if agent["stalled"][-1]:
+            ax.scatter(
+                *agent["pos"][-1],
+                color="#d62728",
+                s=110,
+                marker="X",
+                edgecolors="white",
+                linewidths=0.8,
+                label="Stalled agent" if not stalled_label_used else None,
+            )
+            stalled_label_used = True
+        else:
+            ax.scatter(*agent["pos"][-1], color=color, s=72, marker="^")
+
+        stall_idx = first_stall_marker(agent)
+        if stall_idx is not None:
+            ax.scatter(
+                *agent["pos"][stall_idx],
+                color="#d62728",
+                s=92,
+                marker="X",
+                edgecolors="white",
+                linewidths=0.8,
+                label="Stall point" if stalled_label_used else None,
+            )
+            stalled_label_used = True
 
     for idx, obs in enumerate(data["dynamics"]):
         color = dynamic_colors[idx]
@@ -297,8 +353,10 @@ def save_static_plot(data, out_path, dpi, title):
     print(f"Saved 3D visualization to {out_path}")
 
 
-def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
-    fig, ax, agent_colors, dynamic_colors = make_axes(data, title)
+def save_gif_animation(data, out_path, dpi, title, fps, stride, tail, xlim=None, ylim=None, zlim=None):
+    fig, ax, agent_colors, dynamic_colors = make_axes(
+        data, title, xlim=xlim, ylim=ylim, zlim=zlim
+    )
 
     for idx, agent in enumerate(data["agents"]):
         color = agent_colors[idx]
@@ -330,6 +388,23 @@ def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
         now = ax.scatter([], [], [], color=color, s=66, marker="o")
         agent_now.append(now)
 
+    stalled_now = []
+    has_stalled_agents = any(np.any(agent["stalled"]) for agent in data["agents"])
+    if has_stalled_agents:
+        for idx, agent in enumerate(data["agents"]):
+            now = ax.scatter(
+                [],
+                [],
+                [],
+                color="#d62728",
+                s=104,
+                marker="X",
+                edgecolors="white",
+                linewidths=0.8,
+                label="Stalled agent" if idx == 0 else None,
+            )
+            stalled_now.append(now)
+
     dynamic_now = []
     for idx, obs in enumerate(data["dynamics"]):
         color = dynamic_colors[idx]
@@ -338,6 +413,7 @@ def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
 
     time_text = ax.text2D(0.03, 0.94, "", transform=ax.transAxes, fontsize=10)
     dist_text = ax.text2D(0.03, 0.88, "", transform=ax.transAxes, fontsize=10)
+    status_text = ax.text2D(0.03, 0.82, "", transform=ax.transAxes, fontsize=10)
     ax.legend(loc="upper left", fontsize=9)
 
     frame_ids = frame_indices(len(data["times"]), stride)
@@ -348,9 +424,21 @@ def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
         start = max(0, idx - trail_len + 1)
 
         artists = []
-        for series, now in zip(data["agents"], agent_now):
+        stalled_agents = 0
+        reached_agents = 0
+        for idx_agent, (series, now) in enumerate(zip(data["agents"], agent_now)):
             set_scatter_point(now, series["pos"][idx])
             artists.append(now)
+            if series["reached"][idx]:
+                reached_agents += 1
+            if series["stalled"][idx]:
+                stalled_agents += 1
+                if stalled_now:
+                    set_scatter_point(stalled_now[idx_agent], series["pos"][idx])
+                    artists.append(stalled_now[idx_agent])
+            elif stalled_now:
+                hide_scatter_point(stalled_now[idx_agent])
+                artists.append(stalled_now[idx_agent])
 
         for series, now in zip(data["dynamics"], dynamic_now):
             set_scatter_point(now, series["pos"][idx])
@@ -364,7 +452,10 @@ def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
             dist_text.set_text(f"min clearance = {clearance:.3f} m")
         else:
             dist_text.set_text("min clearance = n/a")
-        artists.extend([time_text, dist_text])
+        status_text.set_text(
+            f"reached = {reached_agents}/{len(data['agents'])}    stalled = {stalled_agents}"
+        )
+        artists.extend([time_text, dist_text, status_text])
         return artists
 
     anim = FuncAnimation(
@@ -380,6 +471,14 @@ def save_gif_animation(data, out_path, dpi, title, fps, stride, tail):
 
 
 def main():
+    def axis_limit(value, axis_name):
+        if value is None:
+            return None
+        lo, hi = value
+        if lo >= hi:
+            raise ValueError(f"{axis_name} expects MIN < MAX, got {lo} >= {hi}")
+        return (lo, hi)
+
     parser = argparse.ArgumentParser(
         description="Visualize the 3D obstacle-avoidance simulation trace."
     )
@@ -400,6 +499,27 @@ def main():
         default=80,
         help="Number of historical frames to keep in the animated trail; 0 keeps all",
     )
+    parser.add_argument(
+        "--xlim",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        help="Optional fixed X-axis range in meters",
+    )
+    parser.add_argument(
+        "--ylim",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        help="Optional fixed Y-axis range in meters",
+    )
+    parser.add_argument(
+        "--zlim",
+        nargs=2,
+        type=float,
+        metavar=("MIN", "MAX"),
+        help="Optional fixed Z-axis range in meters",
+    )
     args = parser.parse_args()
 
     trace_path = Path(args.csv)
@@ -411,6 +531,9 @@ def main():
 
     data = load_trace(trace_path)
     title = args.title.strip() or "3D VO Avoidance Visualization"
+    xlim = axis_limit(args.xlim, "xlim")
+    ylim = axis_limit(args.ylim, "ylim")
+    zlim = axis_limit(args.zlim, "zlim")
 
     suffix = out_path.suffix.lower()
     if suffix == ".gif":
@@ -422,9 +545,20 @@ def main():
             fps=args.fps,
             stride=args.stride,
             tail=args.tail,
+            xlim=xlim,
+            ylim=ylim,
+            zlim=zlim,
         )
     else:
-        save_static_plot(data, out_path, dpi=args.dpi, title=title)
+        save_static_plot(
+            data,
+            out_path,
+            dpi=args.dpi,
+            title=title,
+            xlim=xlim,
+            ylim=ylim,
+            zlim=zlim,
+        )
 
 
 if __name__ == "__main__":
