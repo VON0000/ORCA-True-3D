@@ -85,8 +85,15 @@ let dykstra_project vmax planes v_pref =
   done;
   project_ball vmax !x
 
-let obstacle_radius_sum params self_radius (obs : obstacle) =
-  max eps (self_radius +. obs.radius +. params.vo_margin)
+let obstacle_radius_sum self_radius (obs : obstacle) =
+  max eps (self_radius +. obs.radius)
+
+let coincident_with_obstacle (uav : state) (obs : obstacle) =
+  V3.distance obs.pos uav.pos < eps
+
+let intrudes_safety_zone ~self_radius (uav : state) (obs : obstacle) =
+  let radius = obstacle_radius_sum self_radius obs in
+  V3.distance obs.pos uav.pos <= radius +. eps
 
 let cone_candidate axis basis s radial cos_theta sin_theta =
   let t = (s *. cos_theta) +. (radial *. sin_theta) in
@@ -109,12 +116,12 @@ let clamp_responsibility x = clamp 0.0 1.0 x
 
 let orca_plane_for_obstacle params ~dt ~self_radius (uav : state)
   (obs : obstacle) =
-  let radius = obstacle_radius_sum params self_radius obs in
+  let radius = obstacle_radius_sum self_radius obs in
   let p = V3.(obs.pos - uav.pos) in
   let v_rel = V3.(uav.vel - obs.vel) in
   let dist = V3.norm p in
   let responsibility = clamp_responsibility obs.responsibility in
-  if dist < eps then
+  if coincident_with_obstacle uav obs then
     let normal =
       let n = V3.norm v_rel in
       if n > eps then V3.(1.0 /. n * v_rel) else V3.make 1.0 0.0 0.0
@@ -122,7 +129,7 @@ let orca_plane_for_obstacle params ~dt ~self_radius (uav : state)
     let inv_dt = 1.0 /. max dt 1e-3 in
     let u = V3.(radius *. inv_dt * normal) in
     Some { normal; point = V3.(uav.vel + (responsibility * u)) }
-  else if dist <= radius +. eps then
+  else if intrudes_safety_zone ~self_radius uav obs then
     let inv_dt = 1.0 /. max dt 1e-3 in
     let w = V3.(v_rel - (inv_dt * p)) in
     let unit_w =

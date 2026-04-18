@@ -1,5 +1,15 @@
 let eps = 1e-9
 
+module PairKey = struct
+  type t = string * string
+
+  let compare = Stdlib.compare
+end
+
+module PairMap = Map.Make (PairKey)
+module PairSet = Set.Make (PairKey)
+module StringSet = Set.Make (String)
+
 type runtime_agent = {
   id : string;
   goal : V3.t;
@@ -23,6 +33,7 @@ let pp_v3 (v : V3.t) = Printf.sprintf "(%.3f, %.3f, %.3f)" v.x v.y v.z
 let stop_distance radius = max 0.15 (radius *. 0.75)
 let bool_to_int b = if b then 1 else 0
 let stall_window_seconds = 6.0
+let coincident_stop_seconds = 1.5
 
 let stall_window_steps dt =
   max 6 (int_of_float (ceil (stall_window_seconds /. max eps dt)))
@@ -31,6 +42,12 @@ let stall_progress_threshold ~dt (params : Avoid.params) radius =
   max 1e-3 (max (0.01 *. params.max_speed *. dt) (0.005 *. radius))
 
 let stall_clearance_threshold radius = max 1e-3 (0.01 *. radius)
+
+let coincident_stop_steps dt =
+  max 3 (int_of_float (ceil (coincident_stop_seconds /. max eps dt)))
+
+let ordered_pair id_a id_b =
+  if String.compare id_a id_b <= 0 then (id_a, id_b) else (id_b, id_a)
 
 let csv_float v =
   match classify_float v with
@@ -79,7 +96,12 @@ let make_runtime_dynamic (spec : Scene_config.moving_obstacle) =
   }
 
 let obstacle_of_static (obs : Scene_config.static_obstacle) : Avoid.obstacle =
-  { Avoid.pos = obs.pos; vel = V3.zero; radius = obs.radius; responsibility = 1.0 }
+  {
+    Avoid.pos = obs.pos;
+    vel = V3.zero;
+    radius = obs.radius;
+    responsibility = 1.0;
+  }
 
 let obstacle_of_dynamic (obs : runtime_dynamic) : Avoid.obstacle =
   {
@@ -108,6 +130,94 @@ let min_clearance pos radius obstacles =
       (fun acc obstacle -> min acc (clearance_to_obstacle pos radius obstacle))
       (clearance_to_obstacle pos radius obs)
       rest
+
+let scan_agent_pair_events (agents : runtime_agent list) =
+  let active_agents =
+    List.filter
+      (fun (agent : runtime_agent) -> (not agent.reached) && not agent.stalled)
+      agents
+  in
+  let rec collect coincident intruding (remaining : runtime_agent list) =
+    match remaining with
+    | [] -> (coincident, intruding)
+    | (agent : runtime_agent) :: rest ->
+      let coincident, intruding =
+        List.fold_left
+          (fun (coincident_acc, intruding_acc) (other : runtime_agent) ->
+            let pair = ordered_pair agent.id other.id in
+            let other_obstacle = obstacle_of_agent other in
+            let coincident_acc =
+              if Avoid.coincident_with_obstacle agent.state other_obstacle then
+                PairSet.add pair coincident_acc
+              else coincident_acc
+            in
+            let intruding_acc =
+              if
+                Avoid.intrudes_safety_zone ~self_radius:agent.radius agent.state
+                  other_obstacle
+              then PairSet.add pair intruding_acc
+              else intruding_acc
+            in
+            (coincident_acc, intruding_acc) )
+          (coincident, intruding) rest
+      in
+      collect coincident intruding rest
+  in
+  collect PairSet.empty PairSet.empty active_agents
+
+let update_coincident_pair_counts counts pairs =
+  PairSet.fold
+    (fun pair acc ->
+      let count =
+        match PairMap.find_opt pair counts with
+        | Some value -> value + 1
+        | None -> 1
+      in
+      PairMap.add pair count acc )
+    pairs PairMap.empty
+
+let forced_stop_ids_of_pairs pairs =
+  PairSet.fold
+    (fun (id_a, id_b) acc -> StringSet.add id_a (StringSet.add id_b acc))
+    pairs StringSet.empty
+
+let forced_stop_ids_from_counts ~threshold counts =
+  PairMap.fold
+    (fun (id_a, id_b) count acc ->
+      if count >= threshold then StringSet.add id_a (StringSet.add id_b acc)
+      else acc )
+    counts StringSet.empty
+
+let newly_forced_pairs ~threshold prev_counts next_counts =
+  PairMap.fold
+    (fun ((id_a, id_b) as pair) count acc ->
+      let prev_count =
+        match PairMap.find_opt pair prev_counts with
+        | Some value -> value
+        | None -> 0
+      in
+      if prev_count < threshold && count >= threshold then
+        (id_a, id_b, count) :: acc
+      else acc )
+    next_counts []
+
+let apply_forced_stalls forced_ids (agents : runtime_agent list) =
+  List.map
+    (fun (agent : runtime_agent) ->
+      if
+        agent.reached
+        || agent.stalled
+        || not (StringSet.mem agent.id forced_ids)
+      then agent
+      else
+        {
+          agent with
+          state = { pos = agent.state.pos; vel = V3.zero };
+          reached = false;
+          stalled = true;
+          stall_steps = 0;
+        } )
+    agents
 
 let advance_dynamic ~dt (obs : runtime_dynamic) =
   if obs.reached || obs.speed <= 0.0 then
@@ -327,8 +437,9 @@ let print_progress ~t agents metrics_min_clearance =
     | FP_nan | FP_infinite -> "n/a"
     | _ -> Printf.sprintf "%.3f" metrics_min_clearance
   in
-  Printf.printf "t=%5.2fs reached=%d stalled=%d total=%d min_clearance=%s anchor=%s\n%!"
-    t reached_agents stalled_agents (List.length agents) clearance_text anchor
+  Printf.printf
+    "t=%5.2fs reached=%d stalled=%d total=%d min_clearance=%s anchor=%s\n%!" t
+    reached_agents stalled_agents (List.length agents) clearance_text anchor
 
 let run_demo () =
   let config_path =
@@ -359,8 +470,41 @@ let run_demo () =
   let dynamic_obstacles =
     List.map make_runtime_dynamic config.dynamic_obstacles
   in
-  let rec loop step agents dynamic_obstacles =
+  let pair_stop_threshold = coincident_stop_steps config.dt in
+  let rec loop step pair_counts agents dynamic_obstacles =
     let t = config.dt *. float_of_int step in
+    let coincident_pairs, intruding_pairs = scan_agent_pair_events agents in
+    let pair_counts_next =
+      update_coincident_pair_counts pair_counts coincident_pairs
+    in
+    let forced_ids =
+      StringSet.union
+        (forced_stop_ids_from_counts ~threshold:pair_stop_threshold
+           pair_counts_next )
+        (forced_stop_ids_of_pairs intruding_pairs)
+    in
+    let newly_forced =
+      newly_forced_pairs ~threshold:pair_stop_threshold pair_counts
+        pair_counts_next
+    in
+    PairSet.iter
+      (fun (id_a, id_b) ->
+        Printf.printf
+          "Stopping agents %s and %s at t=%.2fs because they entered each \
+           other's safety zone\n\
+           %!"
+          id_a id_b t )
+      intruding_pairs;
+    List.iter
+      (fun (id_a, id_b, count) ->
+        if not (PairSet.mem (ordered_pair id_a id_b) intruding_pairs) then
+          Printf.printf
+            "Stopping coincident agents %s and %s at t=%.2fs after %d \
+             consecutive dist<eps detections\n\
+             %!"
+            id_a id_b t count )
+      (List.rev newly_forced);
+    let agents = apply_forced_stalls forced_ids agents in
     write_snapshot trace_oc metrics_oc ~step ~t static_obstacles
       dynamic_obstacles agents;
     flush trace_oc;
@@ -403,12 +547,14 @@ let run_demo () =
     else if all_inactive then (
       let reached_agents =
         List.fold_left
-          (fun acc (agent : runtime_agent) -> if agent.reached then acc + 1 else acc)
+          (fun acc (agent : runtime_agent) ->
+            if agent.reached then acc + 1 else acc )
           0 agents
       in
       let stalled_agents =
         List.fold_left
-          (fun acc (agent : runtime_agent) -> if agent.stalled then acc + 1 else acc)
+          (fun acc (agent : runtime_agent) ->
+            if agent.stalled then acc + 1 else acc )
           0 agents
       in
       close_outputs ();
@@ -428,9 +574,9 @@ let run_demo () =
       let dynamic_next =
         List.map (advance_dynamic ~dt:config.dt) dynamic_obstacles
       in
-      loop (step + 1) agents_next dynamic_next
+      loop (step + 1) pair_counts_next agents_next dynamic_next
   in
-  try loop 0 agents dynamic_obstacles
+  try loop 0 PairMap.empty agents dynamic_obstacles
   with e ->
     close_outputs ();
     raise e
