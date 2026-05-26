@@ -18,6 +18,7 @@ type runtime_agent = {
   reached : bool;
   stalled : bool;
   stall_steps : int;
+  last_decision : Avoid.solve_result option;
 }
 
 type runtime_dynamic = {
@@ -70,17 +71,29 @@ let toward ~speed pos goal =
   let dist = V3.norm delta in
   if dist < eps || speed <= 0.0 then V3.zero else V3.(speed /. dist * delta)
 
+let initial_yaw start goal =
+  let delta = V3.(goal - start) in
+  if V3.norm_xy delta > 1e-6 then atan2 delta.y delta.x else 0.0
+
+let make_state ?(vel = V3.zero) ?(acc = V3.zero) ?psi ?(psi_rate = 0.0) pos goal
+    =
+  let psi =
+    match psi with Some value -> value | None -> initial_yaw pos goal
+  in
+  { Avoid.pos; vel; acc; psi; psi_rate }
+
 let make_runtime_agent (spec : Scene_config.agent) =
   let reached = V3.distance spec.start spec.goal <= stop_distance spec.radius in
+  let pos = if reached then spec.goal else spec.start in
   {
     id = spec.id;
     goal = spec.goal;
     radius = spec.radius;
-    state =
-      { Avoid.pos = (if reached then spec.goal else spec.start); vel = V3.zero };
+    state = make_state pos spec.goal;
     reached;
     stalled = false;
     stall_steps = 0;
+    last_decision = None;
   }
 
 let make_runtime_dynamic (spec : Scene_config.moving_obstacle) =
@@ -91,7 +104,8 @@ let make_runtime_dynamic (spec : Scene_config.moving_obstacle) =
     goal = spec.goal;
     radius = spec.radius;
     speed = spec.speed;
-    state = { Avoid.pos; vel = toward ~speed:spec.speed pos spec.goal };
+    state =
+      make_state ~vel:(toward ~speed:spec.speed pos spec.goal) pos spec.goal;
     reached;
   }
 
@@ -212,10 +226,18 @@ let apply_forced_stalls forced_ids (agents : runtime_agent list) =
       else
         {
           agent with
-          state = { pos = agent.state.pos; vel = V3.zero };
+          state =
+            {
+              agent.state with
+              pos = agent.state.pos;
+              vel = V3.zero;
+              acc = V3.zero;
+              psi_rate = 0.0;
+            };
           reached = false;
           stalled = true;
           stall_steps = 0;
+          last_decision = None;
         } )
     agents
 
@@ -225,8 +247,11 @@ let advance_dynamic ~dt (obs : runtime_dynamic) =
       obs with
       state =
         {
+          obs.state with
           pos = (if obs.reached then obs.goal else obs.state.pos);
           vel = V3.zero;
+          acc = V3.zero;
+          psi_rate = 0.0;
         };
       reached = obs.reached;
     }
@@ -234,16 +259,35 @@ let advance_dynamic ~dt (obs : runtime_dynamic) =
     let delta = V3.(obs.goal - obs.state.pos) in
     let dist = V3.norm delta in
     if dist <= stop_distance obs.radius then
-      { obs with state = { pos = obs.goal; vel = V3.zero }; reached = true }
+      {
+        obs with
+        state = { obs.state with pos = obs.goal; vel = V3.zero; acc = V3.zero };
+        reached = true;
+      }
     else
       let step_len = obs.speed *. dt in
       if step_len +. eps >= dist then
-        { obs with state = { pos = obs.goal; vel = V3.zero }; reached = true }
-      else
-        let vel = toward ~speed:obs.speed obs.state.pos obs.goal in
         {
           obs with
-          state = { pos = V3.(obs.state.pos + (dt * vel)); vel };
+          state =
+            { obs.state with pos = obs.goal; vel = V3.zero; acc = V3.zero };
+          reached = true;
+        }
+      else
+        let vel = toward ~speed:obs.speed obs.state.pos obs.goal in
+        let psi =
+          if V3.norm_xy vel > 1e-6 then atan2 vel.y vel.x else obs.state.psi
+        in
+        {
+          obs with
+          state =
+            {
+              pos = V3.(obs.state.pos + (dt * vel));
+              vel;
+              acc = V3.zero;
+              psi;
+              psi_rate = 0.0;
+            };
           reached = false;
         }
 
@@ -256,11 +300,15 @@ let update_agent ~dt params
       agent with
       state =
         {
+          agent.state with
           pos = (if agent.reached then agent.goal else agent.state.pos);
           vel = V3.zero;
+          acc = V3.zero;
+          psi_rate = 0.0;
         };
       reached = agent.reached;
       stalled = agent.stalled;
+      last_decision = None;
     }
   else
     let obstacles =
@@ -278,21 +326,29 @@ let update_agent ~dt params
     in
     let clearance_now = min_clearance agent.state.pos agent.radius obstacles in
     let d_goal_prev = V3.distance agent.state.pos agent.goal in
-    let v_cmd =
-      Avoid.desired_velocity params ~dt ~self_radius:agent.radius
-        ~target:agent.goal agent.state obstacles
+    let decision =
+      Avoid.solve_desired_velocity ~params ~dt ~self_radius:agent.radius
+        ~target:agent.goal ~state:agent.state obstacles
     in
-    let state_next = Avoid.step ~dt agent.state v_cmd in
+    let state_next = Avoid.step_with_result ~dt agent.state decision in
     let clearance_next = min_clearance state_next.pos agent.radius obstacles in
     let d_goal_next = V3.distance state_next.pos agent.goal in
     let reached = d_goal_next <= stop_distance agent.radius in
     if reached then
       {
         agent with
-        state = { pos = agent.goal; vel = V3.zero };
+        state =
+          {
+            state_next with
+            pos = agent.goal;
+            vel = V3.zero;
+            acc = V3.zero;
+            psi_rate = 0.0;
+          };
         reached = true;
         stalled = false;
         stall_steps = 0;
+        last_decision = Some decision;
       }
     else
       let progress = d_goal_prev -. d_goal_next in
@@ -315,10 +371,12 @@ let update_agent ~dt params
       if stall_steps >= stall_window_steps dt then
         {
           agent with
-          state = { pos = agent.state.pos; vel = V3.zero };
+          state =
+            { agent.state with vel = V3.zero; acc = V3.zero; psi_rate = 0.0 };
           reached = false;
           stalled = true;
           stall_steps;
+          last_decision = Some decision;
         }
       else
         {
@@ -327,23 +385,47 @@ let update_agent ~dt params
           reached = false;
           stalled = false;
           stall_steps;
+          last_decision = Some decision;
         }
 
 let write_trace_header oc =
   output_string oc
-    "step,t,kind,id,x,y,z,vx,vy,vz,radius,goal_x,goal_y,goal_z,d_goal,min_clearance,reached,stalled\n"
+    "step,t,kind,id,x,y,z,vx,vy,vz,ax,ay,az,psi,psi_rate,radius,goal_x,goal_y,goal_z,d_goal,min_clearance,reached,stalled,jx,jy,jz,solver_status,solver_iters,solver_residual,yaw_wedge_relaxed\n"
 
 let write_metrics_header oc =
   output_string oc
     "step,t,reached_agents,stalled_agents,total_agents,min_clearance,max_goal_error\n"
 
-let write_trace_row oc ~step ~t ~kind ~id ~(pos : V3.t) ~(vel : V3.t) ~radius
-  ~(goal : V3.t) ~d_goal ~min_clearance ~reached ~stalled =
-  Printf.fprintf oc "%d,%.6f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d\n"
+let string_of_solve_status = function
+  | Avoid.Feasible -> "feasible"
+  | Avoid.OrcaEmpty -> "orca_empty"
+  | Avoid.ExactFeasibleSetEmpty -> "exact_empty"
+  | Avoid.ProjectionDidNotConverge -> "projection_did_not_converge"
+
+let write_trace_row oc ~step ~t ~kind ~id ~(pos : V3.t) ~(vel : V3.t)
+  ~(acc : V3.t) ~psi ~psi_rate ~radius ~(goal : V3.t) ~d_goal ~min_clearance
+  ~reached ~stalled ~decision =
+  let jx, jy, jz, solver_status, solver_iters, solver_residual, yaw_relaxed =
+    match decision with
+    | None -> ("0.000000", "0.000000", "0.000000", "none", "", "", "")
+    | Some (d : Avoid.solve_result) ->
+      ( csv_float d.jerk_cmd.x,
+        csv_float d.jerk_cmd.y,
+        csv_float d.jerk_cmd.z,
+        string_of_solve_status d.status,
+        string_of_int d.solver_iters,
+        csv_float d.solver_residual,
+        string_of_int (bool_to_int d.yaw_wedge_relaxed) )
+  in
+  Printf.fprintf oc
+    "%d,%.6f,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,%d,%s,%s,%s,%s,%s,%s,%s\n"
     step t kind id (csv_float pos.x) (csv_float pos.y) (csv_float pos.z)
-    (csv_float vel.x) (csv_float vel.y) (csv_float vel.z) (csv_float radius)
-    (csv_float goal.x) (csv_float goal.y) (csv_float goal.z) (csv_float d_goal)
-    (csv_float min_clearance) (bool_to_int reached) (bool_to_int stalled)
+    (csv_float vel.x) (csv_float vel.y) (csv_float vel.z) (csv_float acc.x)
+    (csv_float acc.y) (csv_float acc.z) (csv_float psi) (csv_float psi_rate)
+    (csv_float radius) (csv_float goal.x) (csv_float goal.y) (csv_float goal.z)
+    (csv_float d_goal) (csv_float min_clearance) (bool_to_int reached)
+    (bool_to_int stalled) jx jy jz solver_status solver_iters solver_residual
+    yaw_relaxed
 
 let write_snapshot trace_oc metrics_oc ~step ~t
   (static_obstacles : Scene_config.static_obstacle list)
@@ -351,15 +433,18 @@ let write_snapshot trace_oc metrics_oc ~step ~t
   List.iter
     (fun (obs : Scene_config.static_obstacle) ->
       write_trace_row trace_oc ~step ~t ~kind:"static" ~id:obs.id ~pos:obs.pos
-        ~vel:V3.zero ~radius:obs.radius ~goal:obs.pos ~d_goal:0.0
-        ~min_clearance:nan ~reached:true ~stalled:false )
+        ~vel:V3.zero ~acc:V3.zero ~psi:0.0 ~psi_rate:0.0 ~radius:obs.radius
+        ~goal:obs.pos ~d_goal:0.0 ~min_clearance:nan ~reached:true
+        ~stalled:false ~decision:None )
     static_obstacles;
   List.iter
     (fun (obs : runtime_dynamic) ->
       write_trace_row trace_oc ~step ~t ~kind:"dynamic" ~id:obs.id
-        ~pos:obs.state.pos ~vel:obs.state.vel ~radius:obs.radius ~goal:obs.goal
+        ~pos:obs.state.pos ~vel:obs.state.vel ~acc:obs.state.acc
+        ~psi:obs.state.psi ~psi_rate:obs.state.psi_rate ~radius:obs.radius
+        ~goal:obs.goal
         ~d_goal:(V3.distance obs.state.pos obs.goal)
-        ~min_clearance:nan ~reached:obs.reached ~stalled:false )
+        ~min_clearance:nan ~reached:obs.reached ~stalled:false ~decision:None )
     dynamic_obstacles;
   let agent_clearances =
     List.map
@@ -376,9 +461,11 @@ let write_snapshot trace_oc metrics_oc ~step ~t
         let clearance = min_clearance agent.state.pos agent.radius obstacles in
         let d_goal = V3.distance agent.state.pos agent.goal in
         write_trace_row trace_oc ~step ~t ~kind:"agent" ~id:agent.id
-          ~pos:agent.state.pos ~vel:agent.state.vel ~radius:agent.radius
-          ~goal:agent.goal ~d_goal ~min_clearance:clearance
-          ~reached:agent.reached ~stalled:agent.stalled;
+          ~pos:agent.state.pos ~vel:agent.state.vel ~acc:agent.state.acc
+          ~psi:agent.state.psi ~psi_rate:agent.state.psi_rate
+          ~radius:agent.radius ~goal:agent.goal ~d_goal ~min_clearance:clearance
+          ~reached:agent.reached ~stalled:agent.stalled
+          ~decision:agent.last_decision;
         clearance )
       agents
   in

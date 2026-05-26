@@ -30,9 +30,7 @@ type partial = {
   max_steps : int;
   trace_path : string;
   metrics_path : string;
-  max_speed : float;
-  vo_margin : float;
-  time_horizon : float;
+  params : Avoid.params;
   static_obstacles : static_obstacle list;
   dynamic_obstacles : moving_obstacle list;
   agents : agent list;
@@ -44,9 +42,7 @@ let default_partial =
     max_steps = 600;
     trace_path = "sim_trace.csv";
     metrics_path = "sim_metrics.csv";
-    max_speed = Avoid.default_params.max_speed;
-    vo_margin = Avoid.default_params.vo_margin;
-    time_horizon = Avoid.default_params.time_horizon;
+    params = Avoid.default_params;
     static_obstacles = [];
     dynamic_obstacles = [];
     agents = [];
@@ -106,6 +102,14 @@ let parse_int path line_no key value =
   with Failure _ ->
     fail path line_no (Printf.sprintf "`%s` expects an int, got `%s`" key value)
 
+let parse_bool path line_no key value =
+  match String.lowercase_ascii value with
+  | "true" | "1" -> true
+  | "false" | "0" -> false
+  | _ ->
+    fail path line_no
+      (Printf.sprintf "`%s` expects true/false or 1/0, got `%s`" key value)
+
 let parse_vec3 path line_no key value =
   match String.split_on_char ',' value |> List.map trim with
   | [ x; y; z ] ->
@@ -154,28 +158,70 @@ let parse_sim_entry path line_no kvs (cfg : partial) =
 
 let parse_params_entry path line_no kvs (cfg : partial) =
   ensure_only_keys path line_no "params" kvs
-    [ "max_speed"; "vo_margin"; "time_horizon" ];
-  let max_speed =
-    match find_optional kvs "max_speed" with
-    | Some value -> parse_float path line_no "max_speed" value
-    | None -> cfg.max_speed
+    [
+      "max_speed";
+      "vo_margin";
+      "time_horizon";
+      "mass";
+      "g";
+      "thrust_max_total";
+      "theta_max";
+      "jerk_max";
+      "jxy_max";
+      "jz_max";
+      "vz_up_max";
+      "vz_down_max";
+      "az_up_max";
+      "az_down_max";
+      "yaw_rate_max";
+      "yaw_acc_max";
+      "dykstra_max_iter";
+      "dykstra_tol";
+      "residual_tol";
+      "use_exact_dynamic_projection";
+    ];
+  let p = cfg.params in
+  let float_param key current =
+    match find_optional kvs key with
+    | Some value -> parse_float path line_no key value
+    | None -> current
   in
-  let vo_margin =
-    match find_optional kvs "vo_margin" with
-    | Some value -> parse_float path line_no "vo_margin" value
-    | None -> cfg.vo_margin
+  let int_param key current =
+    match find_optional kvs key with
+    | Some value -> parse_int path line_no key value
+    | None -> current
   in
-  let time_horizon =
-    match find_optional kvs "time_horizon" with
-    | Some value -> parse_float path line_no "time_horizon" value
-    | None -> cfg.time_horizon
+  let bool_param key current =
+    match find_optional kvs key with
+    | Some value -> parse_bool path line_no key value
+    | None -> current
   in
-  {
-    cfg with
-    max_speed;
-    vo_margin;
-    time_horizon;
-  }
+  let params =
+    {
+      Avoid.max_speed = float_param "max_speed" p.max_speed;
+      vo_margin = float_param "vo_margin" p.vo_margin;
+      time_horizon = float_param "time_horizon" p.time_horizon;
+      mass = float_param "mass" p.mass;
+      g = float_param "g" p.g;
+      thrust_max_total = float_param "thrust_max_total" p.thrust_max_total;
+      theta_max = float_param "theta_max" p.theta_max;
+      jerk_max = float_param "jerk_max" p.jerk_max;
+      jxy_max = float_param "jxy_max" p.jxy_max;
+      jz_max = float_param "jz_max" p.jz_max;
+      vz_up_max = float_param "vz_up_max" p.vz_up_max;
+      vz_down_max = float_param "vz_down_max" p.vz_down_max;
+      az_up_max = float_param "az_up_max" p.az_up_max;
+      az_down_max = float_param "az_down_max" p.az_down_max;
+      yaw_rate_max = float_param "yaw_rate_max" p.yaw_rate_max;
+      yaw_acc_max = float_param "yaw_acc_max" p.yaw_acc_max;
+      dykstra_max_iter = int_param "dykstra_max_iter" p.dykstra_max_iter;
+      dykstra_tol = float_param "dykstra_tol" p.dykstra_tol;
+      residual_tol = float_param "residual_tol" p.residual_tol;
+      use_exact_dynamic_projection =
+        bool_param "use_exact_dynamic_projection" p.use_exact_dynamic_projection;
+    }
+  in
+  { cfg with params }
 
 let parse_static_entry path line_no kvs (cfg : partial) =
   ensure_only_keys path line_no "static" kvs [ "id"; "pos"; "radius" ];
@@ -231,10 +277,49 @@ let finalize path (cfg : partial) =
     raise (Config_error (Printf.sprintf "%s: dt must be > 0" path));
   if cfg.max_steps < 0 then
     raise (Config_error (Printf.sprintf "%s: max_steps must be >= 0" path));
-  if cfg.max_speed <= 0.0 then
+  let p = cfg.params in
+  if p.max_speed <= 0.0 then
     raise (Config_error (Printf.sprintf "%s: max_speed must be > 0" path));
-  if cfg.time_horizon <= 0.0 then
+  if p.time_horizon <= 0.0 then
     raise (Config_error (Printf.sprintf "%s: time_horizon must be > 0" path));
+  if p.mass <= 0.0 then
+    raise (Config_error (Printf.sprintf "%s: mass must be > 0" path));
+  if p.g <= 0.0 then
+    raise (Config_error (Printf.sprintf "%s: g must be > 0" path));
+  if p.thrust_max_total <= p.mass *. p.g then
+    raise
+      (Config_error
+         (Printf.sprintf "%s: thrust_max_total must be greater than mass * g"
+            path ) );
+  if p.theta_max <= 0.0 || p.theta_max >= 4.0 *. atan 1.0 /. 2.0 then
+    raise
+      (Config_error
+         (Printf.sprintf "%s: theta_max must be > 0 and < pi / 2" path) );
+  let nonnegative_limits =
+    [
+      ("vo_margin", p.vo_margin);
+      ("jerk_max", p.jerk_max);
+      ("jxy_max", p.jxy_max);
+      ("jz_max", p.jz_max);
+      ("vz_up_max", p.vz_up_max);
+      ("vz_down_max", p.vz_down_max);
+      ("az_up_max", p.az_up_max);
+      ("az_down_max", p.az_down_max);
+      ("yaw_rate_max", p.yaw_rate_max);
+      ("yaw_acc_max", p.yaw_acc_max);
+      ("dykstra_tol", p.dykstra_tol);
+      ("residual_tol", p.residual_tol);
+    ]
+  in
+  List.iter
+    (fun (name, value) ->
+      if value < 0.0 then
+        raise
+          (Config_error (Printf.sprintf "%s: %s must be nonnegative" path name))
+      )
+    nonnegative_limits;
+  if p.dykstra_max_iter <= 0 then
+    raise (Config_error (Printf.sprintf "%s: dykstra_max_iter must be > 0" path));
   if cfg.agents = [] then
     raise
       (Config_error
@@ -279,12 +364,7 @@ let finalize path (cfg : partial) =
     max_steps = cfg.max_steps;
     trace_path = cfg.trace_path;
     metrics_path = cfg.metrics_path;
-    params =
-      {
-        max_speed = cfg.max_speed;
-        vo_margin = cfg.vo_margin;
-        time_horizon = cfg.time_horizon;
-      };
+    params = cfg.params;
     static_obstacles = List.rev cfg.static_obstacles;
     dynamic_obstacles = List.rev cfg.dynamic_obstacles;
     agents = List.rev cfg.agents;
